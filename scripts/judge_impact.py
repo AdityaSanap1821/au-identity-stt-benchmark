@@ -11,9 +11,13 @@ Nothing is written to the results database; every judgment is logged to
 ``runs.jsonl`` in the output directory, and re-running the same command
 resumes from it.
 
+With ``--baseline``, nothing is judged: the scores stored in the results
+database are compared against those in a copy of it saved before a re-score.
+
 Usage:
     uv run python scripts/judge_impact.py --services meta,azure,deepgram
     uv run python scripts/judge_impact.py --services meta,azure --judge claude-sonnet-5-5:high
+    uv run python scripts/judge_impact.py --services meta,azure --baseline results_backup.db
 """
 
 import argparse
@@ -102,12 +106,12 @@ def write_disagreements(pairs: list[dict], count: int, path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
-def print_report(by_service: dict[str, list[dict]], judge: str) -> None:
+def print_report(by_service: dict[str, list[dict]], title: str) -> None:
     stats = {name: service_stats(pairs) for name, pairs in by_service.items()}
     stored_rank = {n: i for i, n in enumerate(sorted(stats, key=lambda n: stats[n]["stored_mean"]))}
     new_order = sorted(stats, key=lambda n: stats[n]["new_mean"])
 
-    table = Table(title=f"Stored judge vs {judge}")
+    table = Table(title=title)
     for column in (
         "Service",
         "n",
@@ -148,6 +152,44 @@ def print_report(by_service: dict[str, list[dict]], judge: str) -> None:
     console.print(gaps)
 
 
+def compare_databases(
+    baseline_path: Path, db_path: Path, services: list[str], review: int, output_dir: Path
+) -> None:
+    """Compare the scores stored in a baseline database copy against the current ones.
+
+    Transcriptions that differ between the two databases (re-collected since
+    the copy was made) are left out, since their scores aren't comparable.
+    """
+    current = {pair_key(p): p for p in load_pairs(db_path, services)}
+    judged = []
+    for p in load_pairs(baseline_path, services):
+        c = current.get(pair_key(p))
+        if (
+            c is None
+            or c["transcription"] != p["transcription"]
+            or None in (p["stored_wer"], c["stored_wer"])
+            or float("inf") in (p["stored_wer"], c["stored_wer"])
+        ):
+            continue
+        new = {
+            "wer": c["stored_wer"],
+            "error_count": c["stored_error_count"],
+            "reference_words": c["stored_reference_words"],
+            "errors": c["stored_errors"],
+        }
+        judged.append(dict(p, new=new))
+    by_service = {s: [p for p in judged if p["service_name"] == s] for s in services}
+    missing = [s for s, pairs in by_service.items() if not pairs]
+    if missing:
+        raise SystemExit(f"No comparable scores for: {', '.join(missing)}")
+
+    console.print(f"Comparing {len(judged)} transcriptions across {len(services)} services\n")
+    print_report(by_service, f"{baseline_path.name} vs current scores")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_disagreements(judged, review, output_dir / "disagreements.md")
+    console.print(f"\nDisagreements written to {output_dir}")
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--services", required=True, help="Comma-separated services to re-judge")
@@ -158,6 +200,11 @@ async def main() -> None:
     parser.add_argument(
         "--limit", type=int, help="Judge only the first N transcriptions per service (trial runs)"
     )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="Compare against scores stored in this database copy instead of judging",
+    )
     parser.add_argument("--test", action="store_true", help="Use test_results.db")
     parser.add_argument("--output-dir", type=Path, help="Where to write runs and the report")
     args = parser.parse_args()
@@ -166,9 +213,16 @@ async def main() -> None:
     db_path = config.data_dir / "test_results.db" if args.test else config.results_db
     model, effort = parse_judge(args.judge)
     services = [s.strip() for s in args.services.split(",")]
-    output_dir = args.output_dir or config.data_dir / "judge_experiments" / (
-        f"impact_{args.judge.replace(':', '_')}"
+    name = (
+        f"impact_vs_{args.baseline.stem}"
+        if args.baseline
+        else f"impact_{args.judge.replace(':', '_')}"
     )
+    output_dir = args.output_dir or config.data_dir / "judge_experiments" / name
+
+    if args.baseline:
+        compare_databases(args.baseline, db_path, services, args.review, output_dir)
+        return
 
     pairs = [
         p
@@ -196,7 +250,7 @@ async def main() -> None:
         console.print(f"[yellow]{len(failed)} transcriptions failed and are excluded[/yellow]")
     if new_judgments:
         console.print(f"Cost of this run: ${judgment_cost(evaluator):.2f}\n")
-    print_report(by_service, evaluator.judge.split(" repeats=")[0])
+    print_report(by_service, f"Stored judge vs {evaluator.judge.split(' repeats=')[0]}")
 
     write_disagreements(judged, args.review, output_dir / "disagreements.md")
     (output_dir / "failed.json").write_text(json.dumps([pair_key(p) for p in failed], indent=2))

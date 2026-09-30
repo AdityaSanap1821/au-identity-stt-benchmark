@@ -96,6 +96,9 @@ uv run python scripts/judge_impact.py --services meta,azure,soniox,deepgram,mist
 
 # Trial run on the first 10 transcriptions per service
 uv run python scripts/judge_impact.py --services meta,azure --limit 10
+
+# After a re-score: compare a copy of the database saved beforehand with the current scores (no API calls)
+uv run python scripts/judge_impact.py --services meta,azure --baseline stt_benchmark_data/results_backup.db
 ```
 
 | Flag | Description | Default |
@@ -104,5 +107,6 @@ uv run python scripts/judge_impact.py --services meta,azure --limit 10
 | `--judge` | New judge as `model:effort` | `claude-sonnet-5-5:medium` |
 | `--review` | Disagreements to write out | `40` |
 | `--limit` | Judge only the first N transcriptions per service | all |
+| `--baseline` | Compare this database copy's scores with the current ones instead of judging | none |
 | `--test` | Use `test_results.db` | off |
 | `--output-dir` | Where to write runs and the report | `judge_experiments/impact_*` |
