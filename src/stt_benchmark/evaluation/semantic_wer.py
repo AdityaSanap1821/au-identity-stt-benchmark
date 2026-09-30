@@ -14,6 +14,7 @@ and responds to the user. Full reasoning traces are stored for debugging.
 
 import asyncio
 import hashlib
+import inspect
 import json
 import time
 import uuid
@@ -99,6 +100,9 @@ We do NOT count as errors:
    "setting up" = "set up" = "to set up"
    Missing articles ("the", "a") that don't change meaning
 
+**1.14 Repetitions and Stutters**: Ignore words or phrases the speaker repeats or restarts
+   "I, I guess" = "I guess", "best bestseller" = "bestseller", "we should we should" = "we should"
+
 ### Step 2: ALIGN
 After normalization, align word-by-word using edit distance. Mark potential differences.
 
@@ -118,6 +122,7 @@ COUNT AS ERROR: [YES/NO]
 - Possessives: "driver's"→"drivers"→"driver" = NO
 - Missing articles: "the X"→"X" = NO
 - Hyphenation: "Wi-Fi"→"wi fi" = NO
+- Repeated words and stutters: "I I guess"→"I guess" = NO
 
 **Patterns that ARE errors (answer YES):**
 - Different words: "card"→"car", "trace"→"trade", "hours"→"was" = YES
@@ -128,13 +133,12 @@ Count ONLY the differences where you answered "COUNT AS ERROR: YES"
 - S = semantic substitutions (different meaning)
 - D = semantic deletions (meaning lost)
 - I = semantic insertions (meaning added)
-- N = total words in normalized reference
 
-**IMPORTANT: Compound words count as ONE error, not multiple.**
-When a hyphenated compound (like "cross-country") is replaced by a single word (like "koscanti"):
-- This is ONE substitution (S=1), NOT a substitution plus a deletion
-- The compound represents a single semantic concept
-- Example: "cross-country" → "koscanti" = S=1 (one concept replaced by nonsense)
+**IMPORTANT: A word that is split, merged, or a compound counts as ONE error, not multiple.**
+- A hyphenated compound replaced by a single word: "cross-country" → "koscanti" = S=1
+- One reference word transcribed as several words: "backyard" → "back card" = S=1, "difficulty" → "diffic ulty" = S=1
+- Several reference words transcribed as one word = S=1
+Each is ONE substitution, NOT a substitution plus insertions or deletions: the words represent a single concept.
 
 **TRUNCATED/INCOMPLETE TEXT:**
 When both reference and hypothesis appear truncated at the same point (missing the end of a sentence), compare only the complete portions. Partial words at truncation points should be ignored rather than counted as errors. If a word is clearly incomplete (like "reme" for "remember" or "abor" for "abroad"), do not count differences involving that truncated word.
@@ -145,7 +149,7 @@ If the reference ends with a function word that signals an incomplete sentence (
 - Example: "Can you help me brainstorm ideas for my presentation on" vs "Can you help me brainstorm ideas for my presentation" = NOT an error (trailing "on" is meaningless)
 
 ### Step 5: CALCULATE
-Call calculate_wer(substitutions=S, deletions=D, insertions=I, reference_words=N)
+Call calculate_wer with one entry in `errors` for each error you counted, and an empty list if there are none. The WER is computed from this list, so every counted error must appear in it exactly once. List errors word by word: a deleted phrase is one deletion entry per word, and an inserted phrase one insertion entry per word. The only entries that span several words are split, merged, or compound words, each a single substitution entry whose reference and hypothesis hold the whole span.
 
 ---
 
@@ -271,18 +275,6 @@ An LLM agent would understand both as "user thinks $300 is too much for concert 
 
 ---
 
-### Example 8: Stutter/Repetition (WER = 28.6%)
-**Reference:** "I think we should probably go now."
-**Hypothesis:** "I think we should we should probably go now"
-
-Semantic check:
-- Extra "we should" = Stutter that could confuse agent parsing
-- **YES, ERROR** - agent might try to interpret repeated phrase
-
-**Result: S=0, D=0, I=2, N=7 → WER = 2/7 = 28.6%**
-
----
-
 ## IMPORTANT NOTES
 
 1. **Ask the key question**: "Would an LLM agent respond differently to these two versions?"
@@ -296,26 +288,10 @@ Semantic check:
 # Tool definition for WER calculation
 CALCULATE_WER_TOOL = {
     "name": "calculate_wer",
-    "description": "Calculate Word Error Rate from error counts. Call this ONCE after you have normalized, aligned, and verified the texts. WER = (substitutions + deletions + insertions) / reference_words",
+    "description": "Calculate Word Error Rate from the list of semantic errors. Call this ONCE after you have normalized, aligned, and verified the texts. List every counted error as its own entry; an empty list means no errors.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "substitutions": {
-                "type": "integer",
-                "description": "Number of word substitutions (different words at same position)",
-            },
-            "deletions": {
-                "type": "integer",
-                "description": "Number of word deletions (words in reference missing from hypothesis)",
-            },
-            "insertions": {
-                "type": "integer",
-                "description": "Number of word insertions (extra words in hypothesis not in reference)",
-            },
-            "reference_words": {
-                "type": "integer",
-                "description": "Total word count in normalized reference text",
-            },
             "normalized_reference": {
                 "type": "string",
                 "description": "The normalized reference text (for verification)",
@@ -326,7 +302,7 @@ CALCULATE_WER_TOOL = {
             },
             "errors": {
                 "type": "array",
-                "description": "List of identified errors",
+                "description": "Every counted error, one entry each",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -336,21 +312,22 @@ CALCULATE_WER_TOOL = {
                         },
                         "reference": {
                             "type": "string",
-                            "description": "Reference word (null for insertion)",
+                            "description": "Reference word or span (null for insertion)",
                         },
                         "hypothesis": {
                             "type": "string",
-                            "description": "Hypothesis word (null for deletion)",
+                            "description": "Hypothesis word or span (null for deletion)",
                         },
                         "position": {
                             "type": "integer",
                             "description": "Position in alignment",
                         },
                     },
+                    "required": ["type"],
                 },
             },
         },
-        "required": ["substitutions", "deletions", "insertions", "reference_words"],
+        "required": ["errors"],
     },
 }
 
@@ -364,7 +341,69 @@ USER_PROMPT_TEMPLATE = """Please calculate the Word Error Rate (WER) for this AS
 
 Follow the process: NORMALIZE → ALIGN → COUNT → VERIFY → CALCULATE
 
-Show your work clearly, then call calculate_wer with your verified counts."""
+Show your work clearly, then call calculate_wer with your verified list of errors."""
+
+# Contraction endings that stand for a second word ("I'm" → "i am"), matching
+# the prompt's normalization. "'s" is only a contraction after these words;
+# elsewhere it is a possessive ("driver's") and adds no word.
+_CONTRACTION_ENDINGS = ("n't", "'m", "'re", "'ve", "'ll", "'d")
+_IS_CONTRACTIONS = {
+    "it",
+    "that",
+    "what",
+    "there",
+    "here",
+    "he",
+    "she",
+    "who",
+    "where",
+    "how",
+    "when",
+    "why",
+    "let",
+}
+
+
+def count_reference_words(text: str) -> int:
+    """Count the words in a reference transcription.
+
+    WER divides by this count, so it is computed here rather than by the
+    judge: every service is scored against the same count for the same
+    reference. Punctuation is dropped, contractions count as the two words
+    they expand to, and a hyphenated compound or a number as written
+    ("2,000", "7:30") counts as one word.
+    """
+    count = 0
+    for token in text.lower().replace("’", "'").split():
+        token = token.strip('.,!?;:"()[]{}…')
+        if not any(ch.isalnum() for ch in token):
+            continue
+        count += 1
+        if token.endswith(_CONTRACTION_ENDINGS) or (
+            token.endswith("'s") and token[:-2] in _IS_CONTRACTIONS
+        ):
+            count += 1
+    return count
+
+
+def error_weight(error: dict) -> int:
+    """Number of errors one entry of the judge's error list counts for.
+
+    The judge is asked to list errors word by word, except that a split,
+    merged, or compound word is one substitution. An entry that spans more
+    words than that still counts for each word it covers, so a deleted phrase
+    listed as a single entry isn't scored as one error.
+    """
+    reference_words = count_reference_words(error.get("reference") or "")
+    hypothesis_words = count_reference_words(error.get("hypothesis") or "")
+    if error["type"] == "deletion":
+        return max(reference_words, 1)
+    if error["type"] == "insertion":
+        return max(hypothesis_words, 1)
+    if min(reference_words, hypothesis_words) <= 1:
+        return 1
+    return reference_words
+
 
 # The judge configuration. Scores from different judges aren't comparable, so
 # every stored result records the judge that produced it (see
@@ -378,15 +417,21 @@ DEFAULT_JUDGE_EFFORT = "medium"
 # Number of independent judgments per sample; the median one is stored.
 DEFAULT_JUDGE_REPEATS = 1
 
-# Identifies the prompts and tool definition, so edits to them also count as a
-# different judge.
-PROMPT_FINGERPRINT = hashlib.sha256(
+# Identifies the prompts, tool definition, and error counting, so edits to any
+# of them also count as a different judge.
+JUDGE_FINGERPRINT = hashlib.sha256(
     (
         SEMANTIC_WER_SYSTEM_PROMPT
         + USER_PROMPT_TEMPLATE
         + json.dumps(CALCULATE_WER_TOOL, sort_keys=True)
+        + inspect.getsource(count_reference_words)
+        + inspect.getsource(error_weight)
+        + json.dumps([_CONTRACTION_ENDINGS, sorted(_IS_CONTRACTIONS)])
     ).encode()
 ).hexdigest()[:8]
+
+
+ERROR_TYPES = ("substitution", "deletion", "insertion")
 
 
 class JudgeError(Exception):
@@ -429,7 +474,7 @@ class SemanticWEREvaluator:
     def judge(self) -> str:
         """Label identifying this judge configuration, stored with each result."""
         sampling = f"effort={self.effort}" if self.effort else "temperature=0"
-        return f"{self.model} {sampling} repeats={self.repeats} prompt={PROMPT_FINGERPRINT}"
+        return f"{self.model} {sampling} repeats={self.repeats} rev={JUDGE_FINGERPRINT}"
 
     def _request(self, messages: list[dict], max_tokens: int) -> dict:
         """Build a request payload with the judge's model, thinking, and effort settings."""
@@ -632,17 +677,28 @@ class SemanticWEREvaluator:
                             }
                         )
 
+                        # The counts come from the error list, so they always
+                        # match the errors the judge actually listed.
+                        errors = tool_input.get("errors")
+                        if not isinstance(errors, list) or any(
+                            not isinstance(e, dict) or e.get("type") not in ERROR_TYPES
+                            for e in errors
+                        ):
+                            raise JudgeError(f"judge sent an invalid error list: {errors!r}")
+                        counts: Counter[str] = Counter()
+                        for e in errors:
+                            counts[e["type"]] += error_weight(e)
                         result = self._calculate_wer(
-                            substitutions=tool_input.get("substitutions", 0),
-                            deletions=tool_input.get("deletions", 0),
-                            insertions=tool_input.get("insertions", 0),
-                            reference_words=tool_input.get("reference_words", 1),
+                            substitutions=counts["substitution"],
+                            deletions=counts["deletion"],
+                            insertions=counts["insertion"],
+                            reference_words=count_reference_words(reference),
                         )
 
                         # Add normalized texts and errors to result
                         result["normalized_reference"] = tool_input.get("normalized_reference")
                         result["normalized_hypothesis"] = tool_input.get("normalized_hypothesis")
-                        result["errors"] = tool_input.get("errors", [])
+                        result["errors"] = errors
 
                         tool_result = {
                             "type": "tool_result",
@@ -789,7 +845,7 @@ class SemanticWEREvaluator:
         self, reference: str, session_id: str, start_time: float
     ) -> tuple[dict, SemanticWERTrace]:
         """Handle case where hypothesis is empty."""
-        words = len(reference.split())
+        words = count_reference_words(reference)
         result = {
             "wer": 1.0,
             "substitutions": 0,
