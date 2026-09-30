@@ -13,9 +13,12 @@ and responds to the user. Full reasoning traces are stored for debugging.
 """
 
 import asyncio
+import hashlib
+import inspect
 import json
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -97,6 +100,9 @@ We do NOT count as errors:
    "setting up" = "set up" = "to set up"
    Missing articles ("the", "a") that don't change meaning
 
+**1.14 Repetitions and Stutters**: Ignore words or phrases the speaker repeats or restarts
+   "I, I guess" = "I guess", "best bestseller" = "bestseller", "we should we should" = "we should"
+
 ### Step 2: ALIGN
 After normalization, align word-by-word using edit distance. Mark potential differences.
 
@@ -116,6 +122,7 @@ COUNT AS ERROR: [YES/NO]
 - Possessives: "driver's"→"drivers"→"driver" = NO
 - Missing articles: "the X"→"X" = NO
 - Hyphenation: "Wi-Fi"→"wi fi" = NO
+- Repeated words and stutters: "I I guess"→"I guess" = NO
 
 **Patterns that ARE errors (answer YES):**
 - Different words: "card"→"car", "trace"→"trade", "hours"→"was" = YES
@@ -126,13 +133,12 @@ Count ONLY the differences where you answered "COUNT AS ERROR: YES"
 - S = semantic substitutions (different meaning)
 - D = semantic deletions (meaning lost)
 - I = semantic insertions (meaning added)
-- N = total words in normalized reference
 
-**IMPORTANT: Compound words count as ONE error, not multiple.**
-When a hyphenated compound (like "cross-country") is replaced by a single word (like "koscanti"):
-- This is ONE substitution (S=1), NOT a substitution plus a deletion
-- The compound represents a single semantic concept
-- Example: "cross-country" → "koscanti" = S=1 (one concept replaced by nonsense)
+**IMPORTANT: A word that is split, merged, or a compound counts as ONE error, not multiple.**
+- A hyphenated compound replaced by a single word: "cross-country" → "koscanti" = S=1
+- One reference word transcribed as several words: "backyard" → "back card" = S=1, "difficulty" → "diffic ulty" = S=1
+- Several reference words transcribed as one word = S=1
+Each is ONE substitution, NOT a substitution plus insertions or deletions: the words represent a single concept.
 
 **TRUNCATED/INCOMPLETE TEXT:**
 When both reference and hypothesis appear truncated at the same point (missing the end of a sentence), compare only the complete portions. Partial words at truncation points should be ignored rather than counted as errors. If a word is clearly incomplete (like "reme" for "remember" or "abor" for "abroad"), do not count differences involving that truncated word.
@@ -143,7 +149,7 @@ If the reference ends with a function word that signals an incomplete sentence (
 - Example: "Can you help me brainstorm ideas for my presentation on" vs "Can you help me brainstorm ideas for my presentation" = NOT an error (trailing "on" is meaningless)
 
 ### Step 5: CALCULATE
-Call calculate_wer(substitutions=S, deletions=D, insertions=I, reference_words=N)
+Call calculate_wer with one entry in `errors` for each error you counted, and an empty list if there are none. The WER is computed from this list, so every counted error must appear in it exactly once. List errors word by word: a deleted phrase is one deletion entry per word, and an inserted phrase one insertion entry per word. The only entries that span several words are split, merged, or compound words, each a single substitution entry whose reference and hypothesis hold the whole span.
 
 ---
 
@@ -269,18 +275,6 @@ An LLM agent would understand both as "user thinks $300 is too much for concert 
 
 ---
 
-### Example 8: Stutter/Repetition (WER = 28.6%)
-**Reference:** "I think we should probably go now."
-**Hypothesis:** "I think we should we should probably go now"
-
-Semantic check:
-- Extra "we should" = Stutter that could confuse agent parsing
-- **YES, ERROR** - agent might try to interpret repeated phrase
-
-**Result: S=0, D=0, I=2, N=7 → WER = 2/7 = 28.6%**
-
----
-
 ## IMPORTANT NOTES
 
 1. **Ask the key question**: "Would an LLM agent respond differently to these two versions?"
@@ -294,26 +288,10 @@ Semantic check:
 # Tool definition for WER calculation
 CALCULATE_WER_TOOL = {
     "name": "calculate_wer",
-    "description": "Calculate Word Error Rate from error counts. Call this ONCE after you have normalized, aligned, and verified the texts. WER = (substitutions + deletions + insertions) / reference_words",
+    "description": "Calculate Word Error Rate from the list of semantic errors. Call this ONCE after you have normalized, aligned, and verified the texts. List every counted error as its own entry; an empty list means no errors.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "substitutions": {
-                "type": "integer",
-                "description": "Number of word substitutions (different words at same position)",
-            },
-            "deletions": {
-                "type": "integer",
-                "description": "Number of word deletions (words in reference missing from hypothesis)",
-            },
-            "insertions": {
-                "type": "integer",
-                "description": "Number of word insertions (extra words in hypothesis not in reference)",
-            },
-            "reference_words": {
-                "type": "integer",
-                "description": "Total word count in normalized reference text",
-            },
             "normalized_reference": {
                 "type": "string",
                 "description": "The normalized reference text (for verification)",
@@ -324,7 +302,7 @@ CALCULATE_WER_TOOL = {
             },
             "errors": {
                 "type": "array",
-                "description": "List of identified errors",
+                "description": "Every counted error, one entry each",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -334,70 +312,217 @@ CALCULATE_WER_TOOL = {
                         },
                         "reference": {
                             "type": "string",
-                            "description": "Reference word (null for insertion)",
+                            "description": "Reference word or span (null for insertion)",
                         },
                         "hypothesis": {
                             "type": "string",
-                            "description": "Hypothesis word (null for deletion)",
+                            "description": "Hypothesis word or span (null for deletion)",
                         },
                         "position": {
                             "type": "integer",
                             "description": "Position in alignment",
                         },
                     },
+                    "required": ["type"],
                 },
             },
         },
-        "required": ["substitutions", "deletions", "insertions", "reference_words"],
+        "required": ["errors"],
     },
 }
+
+USER_PROMPT_TEMPLATE = """Please calculate the Word Error Rate (WER) for this ASR transcription.
+
+**Reference (ground truth):**
+{reference}
+
+**Hypothesis (ASR transcription):**
+{hypothesis}
+
+Follow the process: NORMALIZE → ALIGN → COUNT → VERIFY → CALCULATE
+
+Show your work clearly, then call calculate_wer with your verified list of errors."""
+
+# Contraction endings that stand for a second word ("I'm" → "i am"), matching
+# the prompt's normalization. "'s" is only a contraction after these words;
+# elsewhere it is a possessive ("driver's") and adds no word.
+_CONTRACTION_ENDINGS = ("n't", "'m", "'re", "'ve", "'ll", "'d")
+_IS_CONTRACTIONS = {
+    "it",
+    "that",
+    "what",
+    "there",
+    "here",
+    "he",
+    "she",
+    "who",
+    "where",
+    "how",
+    "when",
+    "why",
+    "let",
+}
+
+
+def count_reference_words(text: str) -> int:
+    """Count the words in a reference transcription.
+
+    WER divides by this count, so it is computed here rather than by the
+    judge: every service is scored against the same count for the same
+    reference. Punctuation is dropped, contractions count as the two words
+    they expand to, and a hyphenated compound or a number as written
+    ("2,000", "7:30") counts as one word.
+    """
+    count = 0
+    for token in text.lower().replace("’", "'").split():
+        token = token.strip('.,!?;:"()[]{}…')
+        if not any(ch.isalnum() for ch in token):
+            continue
+        count += 1
+        if token.endswith(_CONTRACTION_ENDINGS) or (
+            token.endswith("'s") and token[:-2] in _IS_CONTRACTIONS
+        ):
+            count += 1
+    return count
+
+
+def error_weight(error: dict) -> int:
+    """Number of errors one entry of the judge's error list counts for.
+
+    The judge is asked to list errors word by word, except that a split,
+    merged, or compound word is one substitution. An entry that spans more
+    words than that still counts for each word it covers, so a deleted phrase
+    listed as a single entry isn't scored as one error.
+    """
+    reference_words = count_reference_words(error.get("reference") or "")
+    hypothesis_words = count_reference_words(error.get("hypothesis") or "")
+    if error["type"] == "deletion":
+        return max(reference_words, 1)
+    if error["type"] == "insertion":
+        return max(hypothesis_words, 1)
+    if min(reference_words, hypothesis_words) <= 1:
+        return 1
+    return reference_words
+
+
+# The judge configuration. Scores from different judges aren't comparable, so
+# every stored result records the judge that produced it (see
+# ``SemanticWEREvaluator.judge``) and the ``wer`` command refuses to mix judges
+# within a service. Changing any of these requires re-scoring every service.
+DEFAULT_JUDGE_MODEL = "claude-sonnet-5-5"
+# At "low" the model decides per request whether to think, so easy and hard
+# transcripts would be judged differently; from "medium" up it thinks on
+# nearly every request.
+DEFAULT_JUDGE_EFFORT = "medium"
+# Number of independent judgments per sample; the median one is stored.
+DEFAULT_JUDGE_REPEATS = 1
+
+# Identifies the prompts, tool definition, and error counting, so edits to any
+# of them also count as a different judge.
+JUDGE_FINGERPRINT = hashlib.sha256(
+    (
+        SEMANTIC_WER_SYSTEM_PROMPT
+        + USER_PROMPT_TEMPLATE
+        + json.dumps(CALCULATE_WER_TOOL, sort_keys=True)
+        + inspect.getsource(count_reference_words)
+        + inspect.getsource(error_weight)
+        + json.dumps([_CONTRACTION_ENDINGS, sorted(_IS_CONTRACTIONS)])
+    ).encode()
+).hexdigest()[:8]
+
+
+ERROR_TYPES = ("substitution", "deletion", "insertion")
+
+
+class JudgeError(Exception):
+    """The judge finished without producing a WER result."""
 
 
 class SemanticWEREvaluator:
     """Semantic WER evaluator using Claude with tool use.
 
     Adapted from asr_eval AgentSDKJudge.
+
+    ``effort=None`` runs the judge without thinking at temperature 0, the
+    setup for models that predate adaptive thinking (such as the Claude
+    Sonnet 4.5 judge), so earlier scores can be reproduced for comparison.
     """
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = DEFAULT_JUDGE_MODEL,
+        effort: str | None = DEFAULT_JUDGE_EFFORT,
+        repeats: int = DEFAULT_JUDGE_REPEATS,
         db_path: Path | None = None,
         max_concurrency: int = 50,
     ):
         self.config = get_config()
         self.model = model
+        self.effort = effort
+        self.repeats = repeats
         self.db = Database(db_path=db_path)
         self._api_semaphore = asyncio.Semaphore(max_concurrency)
+        # Running token totals across every API call this evaluator makes.
+        self.usage: Counter[str] = Counter()
 
         if not self.config.anthropic_api_key:
             raise ValueError("ANTHROPIC_API_KEY not set in environment")
 
         self.client = anthropic.AsyncAnthropic(api_key=self.config.anthropic_api_key)
 
-    async def warm_cache(self) -> None:
-        """Send a minimal request to warm the prompt cache.
+    @property
+    def judge(self) -> str:
+        """Label identifying this judge configuration, stored with each result."""
+        sampling = f"effort={self.effort}" if self.effort else "temperature=0"
+        return f"{self.model} {sampling} repeats={self.repeats} rev={JUDGE_FINGERPRINT}"
 
-        Establishes the cache for the system prompt and tool definition
-        before any real evaluation requests are sent.  This ensures all
-        concurrent evaluation requests get cache hits.
-        """
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=1,
-            system=[
+    def _request(self, messages: list[dict], max_tokens: int) -> dict:
+        """Build a request payload with the judge's model, thinking, and effort settings."""
+        if self.effort:
+            # "summarized" keeps the model's reasoning readable in the stored trace.
+            sampling = {
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"effort": self.effort},
+            }
+        else:
+            sampling = {"temperature": 0}
+        return {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            **sampling,
+            "system": [
                 {
                     "type": "text",
                     "text": SEMANTIC_WER_SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            tools=[CALCULATE_WER_TOOL],
-            messages=[{"role": "user", "content": "."}],
+            "tools": [CALCULATE_WER_TOOL],
+            "messages": messages,
+        }
+
+    async def warm_cache(self) -> None:
+        """Send a minimal request to warm the prompt cache.
+
+        Establishes the cache for the system prompt and tool definition
+        before any real evaluation requests are sent.  This ensures all
+        concurrent evaluation requests get cache hits.  ``max_tokens=0``
+        writes the cache without generating output; the thinking and
+        effort settings must match the real requests for them to hit it.
+        """
+        response = await self.client.messages.create(
+            **self._request([{"role": "user", "content": "."}], max_tokens=0)
         )
         logger.info(
             f"Prompt cache warmed ({getattr(response.usage, 'cache_creation_input_tokens', 0) or 0:,} tokens written)"
         )
+
+    def _record_usage(self, response: anthropic.types.Message) -> None:
+        usage = response.usage
+        self.usage["input_tokens"] += usage.input_tokens
+        self.usage["output_tokens"] += usage.output_tokens
+        self.usage["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
+        self.usage["cache_creation_input_tokens"] += usage.cache_creation_input_tokens or 0
 
     async def _api_call(
         self,
@@ -405,15 +530,16 @@ class SemanticWEREvaluator:
         filename: str,
         max_retries: int = 5,
     ) -> anthropic.types.Message:
-        """Make a single API call with concurrency control and retry.
+        """Make a single API call with retry.
 
-        Acquires the global semaphore before calling the API, and retries
-        on rate-limit (429) and server (5xx) errors with exponential
-        backoff.
+        Retries on rate-limit (429) and server (5xx) errors with
+        exponential backoff.
         """
         for attempt in range(1, max_retries + 1):
             try:
-                return await self.client.messages.create(**request_payload)
+                response = await self.client.messages.create(**request_payload)
+                self._record_usage(response)
+                return response
             except (
                 anthropic.RateLimitError,
                 anthropic.InternalServerError,
@@ -482,18 +608,7 @@ class SemanticWEREvaluator:
         if not hypothesis.strip():
             return self._no_hypothesis_result(reference, session_id, start_time)
 
-        # Build the user prompt
-        user_prompt = f"""Please calculate the Word Error Rate (WER) for this ASR transcription.
-
-**Reference (ground truth):**
-{reference}
-
-**Hypothesis (ASR transcription):**
-{hypothesis}
-
-Follow the process: NORMALIZE → ALIGN → COUNT → VERIFY → CALCULATE
-
-Show your work clearly, then call calculate_wer with your verified counts."""
+        user_prompt = USER_PROMPT_TEMPLATE.format(reference=reference, hypothesis=hypothesis)
 
         # Initialize conversation
         messages = [{"role": "user", "content": user_prompt}]
@@ -508,23 +623,7 @@ Show your work clearly, then call calculate_wer with your verified counts."""
             num_turns += 1
 
             try:
-                response = await self._api_call(
-                    {
-                        "model": self.model,
-                        "max_tokens": 4096,
-                        "temperature": 0,
-                        "system": [
-                            {
-                                "type": "text",
-                                "text": SEMANTIC_WER_SYSTEM_PROMPT,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ],
-                        "tools": [CALCULATE_WER_TOOL],
-                        "messages": messages,
-                    },
-                    filename,
-                )
+                response = await self._api_call(self._request(messages, max_tokens=16000), filename)
             except Exception as e:
                 logger.error(f"Error calling Claude API: {e}")
                 raise
@@ -532,7 +631,9 @@ Show your work clearly, then call calculate_wer with your verified counts."""
             # Record the assistant's response
             assistant_content = []
             for block in response.content:
-                if block.type == "text":
+                if block.type == "thinking" and block.thinking:
+                    assistant_content.append({"type": "thinking", "thinking": block.thinking})
+                elif block.type == "text":
                     assistant_content.append({"type": "text", "text": block.text})
                 elif block.type == "tool_use":
                     assistant_content.append(
@@ -552,13 +653,14 @@ Show your work clearly, then call calculate_wer with your verified counts."""
                 }
             )
 
-            # Check if we're done
-            if response.stop_reason == "end_turn":
-                # Model finished without calling tool - this shouldn't happen
-                logger.warning("Model finished without calling calculate_wer")
-                break
+            # Anything but a tool call (finishing without calling calculate_wer,
+            # running out of tokens, or a refusal) leaves no result to store.
+            if response.stop_reason != "tool_use":
+                reason = response.stop_reason
+                if reason == "refusal" and response.stop_details:
+                    reason = f"refusal ({response.stop_details.category})"
+                raise JudgeError(f"judge stopped without a result: {reason}")
 
-            # Handle tool use
             if response.stop_reason == "tool_use":
                 tool_results = []
 
@@ -575,17 +677,28 @@ Show your work clearly, then call calculate_wer with your verified counts."""
                             }
                         )
 
+                        # The counts come from the error list, so they always
+                        # match the errors the judge actually listed.
+                        errors = tool_input.get("errors")
+                        if not isinstance(errors, list) or any(
+                            not isinstance(e, dict) or e.get("type") not in ERROR_TYPES
+                            for e in errors
+                        ):
+                            raise JudgeError(f"judge sent an invalid error list: {errors!r}")
+                        counts: Counter[str] = Counter()
+                        for e in errors:
+                            counts[e["type"]] += error_weight(e)
                         result = self._calculate_wer(
-                            substitutions=tool_input.get("substitutions", 0),
-                            deletions=tool_input.get("deletions", 0),
-                            insertions=tool_input.get("insertions", 0),
-                            reference_words=tool_input.get("reference_words", 1),
+                            substitutions=counts["substitution"],
+                            deletions=counts["deletion"],
+                            insertions=counts["insertion"],
+                            reference_words=count_reference_words(reference),
                         )
 
                         # Add normalized texts and errors to result
                         result["normalized_reference"] = tool_input.get("normalized_reference")
                         result["normalized_hypothesis"] = tool_input.get("normalized_hypothesis")
-                        result["errors"] = tool_input.get("errors", [])
+                        result["errors"] = errors
 
                         tool_result = {
                             "type": "tool_result",
@@ -613,21 +726,7 @@ Show your work clearly, then call calculate_wer with your verified counts."""
                     # Get final response after tool result
                     try:
                         final_response = await self._api_call(
-                            {
-                                "model": self.model,
-                                "max_tokens": 1024,
-                                "temperature": 0,
-                                "system": [
-                                    {
-                                        "type": "text",
-                                        "text": SEMANTIC_WER_SYSTEM_PROMPT,
-                                        "cache_control": {"type": "ephemeral"},
-                                    }
-                                ],
-                                "tools": [CALCULATE_WER_TOOL],
-                                "messages": messages,
-                            },
-                            filename,
+                            self._request(messages, max_tokens=4096), filename
                         )
 
                         final_content = []
@@ -647,11 +746,14 @@ Show your work clearly, then call calculate_wer with your verified counts."""
 
                     break
 
+        if result is None:
+            raise JudgeError(f"judge did not call calculate_wer within {max_turns} turns")
+
         duration_ms = int((time.time() - start_time) * 1000)
 
         # Convert errors to SemanticError objects
         errors = None
-        if result and result.get("errors"):
+        if result.get("errors"):
             errors = [
                 SemanticError(
                     error_type=e.get("type", "substitution"),
@@ -669,20 +771,20 @@ Show your work clearly, then call calculate_wer with your verified counts."""
             session_id=session_id,
             conversation_trace=conversation_trace,
             tool_calls=tool_calls,
-            normalized_reference=result.get("normalized_reference") if result else None,
-            normalized_hypothesis=result.get("normalized_hypothesis") if result else None,
-            wer=result["wer"] if result else 0.0,
-            substitutions=result["substitutions"] if result else 0,
-            deletions=result["deletions"] if result else 0,
-            insertions=result["insertions"] if result else 0,
-            reference_words=result["reference_words"] if result else 0,
+            normalized_reference=result.get("normalized_reference"),
+            normalized_hypothesis=result.get("normalized_hypothesis"),
+            wer=result["wer"],
+            substitutions=result["substitutions"],
+            deletions=result["deletions"],
+            insertions=result["insertions"],
+            reference_words=result["reference_words"],
             errors=errors,
             duration_ms=duration_ms,
             num_turns=num_turns,
             model_used=self.model,
         )
 
-        return result or {"wer": 0.0}, trace
+        return result, trace
 
     def _empty_result(self, session_id: str, start_time: float) -> tuple[dict, SemanticWERTrace]:
         """Handle case where both texts are empty."""
@@ -743,7 +845,7 @@ Show your work clearly, then call calculate_wer with your verified counts."""
         self, reference: str, session_id: str, start_time: float
     ) -> tuple[dict, SemanticWERTrace]:
         """Handle case where hypothesis is empty."""
-        words = len(reference.split())
+        words = count_reference_words(reference)
         result = {
             "wer": 1.0,
             "substitutions": 0,
@@ -776,29 +878,56 @@ Show your work clearly, then call calculate_wer with your verified counts."""
         max_retries: int = 3,
         timeout_secs: float = 5 * 60,
     ) -> tuple[dict, SemanticWERTrace] | None:
-        """Evaluate with timeout and retry logic.
+        """Evaluate with concurrency control, timeout, and retry logic.
 
         Transient API errors (429, 5xx) are handled per-call inside
-        ``_api_call``.  This method handles overall timeouts and
-        unexpected errors.  Returns None if all attempts fail.
+        ``_api_call``.  This method retries timeouts and judge runs that
+        ended without a result, and gives up on unexpected errors.
+        Returns None if all attempts fail.
         """
         for attempt in range(1, max_retries + 1):
             try:
-                return await asyncio.wait_for(
-                    self.evaluate(reference, hypothesis, filename=filename),
-                    timeout=timeout_secs,
-                )
+                async with self._api_semaphore:
+                    return await asyncio.wait_for(
+                        self.evaluate(reference, hypothesis, filename=filename),
+                        timeout=timeout_secs,
+                    )
             except TimeoutError:
                 logger.warning(
                     f"{filename}: timed out after {timeout_secs}s (attempt {attempt}/{max_retries})"
                 )
-                if attempt == max_retries:
-                    logger.error(f"{filename}: failed after {max_retries} timeout retries")
+            except JudgeError as e:
+                logger.warning(f"{filename}: {e} (attempt {attempt}/{max_retries})")
             except Exception as e:
                 logger.error(f"{filename}: evaluation error: {e}")
-                break
+                return None
 
+        logger.error(f"{filename}: failed after {max_retries} attempts")
         return None
+
+    async def evaluate_repeated(
+        self,
+        reference: str,
+        hypothesis: str,
+        filename: str = "",
+    ) -> tuple[dict, SemanticWERTrace] | None:
+        """Judge a transcription ``self.repeats`` times and return the median judgment.
+
+        The judge doesn't give identical answers on every run, so the run
+        with the median WER is kept to damp that noise.  Returns None
+        unless every run succeeds, so a stored result always reflects the
+        full set of runs.
+        """
+        pairs = await asyncio.gather(
+            *(
+                self.evaluate_with_retry(reference, hypothesis, filename=filename)
+                for _ in range(self.repeats)
+            )
+        )
+        if any(pair is None for pair in pairs):
+            return None
+        pairs.sort(key=lambda pair: pair[0]["wer"])
+        return pairs[len(pairs) // 2]
 
     async def evaluate_service(
         self,
@@ -833,66 +962,64 @@ Show your work clearly, then call calculate_wer with your verified counts."""
         async def _eval_sample(sample):
             nonlocal completed
 
-            async with self._api_semaphore:
-                # Get result and ground truth
-                result, gt = await self.db.get_result_with_ground_truth(
-                    sample.sample_id, service_name, model_name
-                )
+            # Get result and ground truth
+            result, gt = await self.db.get_result_with_ground_truth(
+                sample.sample_id, service_name, model_name
+            )
 
-                if not result or not result.transcription:
-                    logger.warning(f"No transcription for sample {sample.sample_id}")
-                    return
+            if not result or not result.transcription:
+                logger.warning(f"No transcription for sample {sample.sample_id}")
+                return
 
-                if not gt:
-                    logger.warning(f"No ground truth for sample {sample.sample_id}")
-                    return
+            if not gt:
+                logger.warning(f"No ground truth for sample {sample.sample_id}")
+                return
 
-                # Evaluate with Claude (with retry and timeout)
-                eval_pair = await self.evaluate_with_retry(
-                    gt.text, result.transcription, filename=sample.sample_id
-                )
+            # Evaluate with Claude (with retry and timeout)
+            eval_pair = await self.evaluate_repeated(
+                gt.text, result.transcription, filename=sample.sample_id
+            )
 
-                if eval_pair is None:
-                    logger.error(f"Failed to evaluate {sample.sample_id}, skipping")
-                    return
+            if eval_pair is None:
+                logger.error(f"Failed to evaluate {sample.sample_id}, skipping")
+                return
 
-                eval_result, trace = eval_pair
+            eval_result, trace = eval_pair
 
-                # Update trace with sample info
-                trace.sample_id = sample.sample_id
-                trace.service_name = service_name
-                trace.model_name = model_name
+            # Update trace with sample info
+            trace.sample_id = sample.sample_id
+            trace.service_name = service_name
+            trace.model_name = model_name
 
-                # Store the trace
-                await self.db.insert_semantic_wer_trace(trace)
+            # Store the trace
+            await self.db.insert_semantic_wer_trace(trace)
 
-                # Create metrics
-                metrics = WERMetrics(
-                    sample_id=sample.sample_id,
-                    service_name=service_name,
-                    model_name=model_name,
-                    wer=eval_result["wer"],
-                    substitutions=eval_result["substitutions"],
-                    deletions=eval_result["deletions"],
-                    insertions=eval_result["insertions"],
-                    reference_words=eval_result["reference_words"],
-                    errors=trace.errors,
-                    normalized_reference=eval_result.get("normalized_reference"),
-                    normalized_hypothesis=eval_result.get("normalized_hypothesis"),
-                    timestamp=datetime.now(UTC),
-                )
+            # Create metrics
+            metrics = WERMetrics(
+                sample_id=sample.sample_id,
+                service_name=service_name,
+                model_name=model_name,
+                wer=eval_result["wer"],
+                substitutions=eval_result["substitutions"],
+                deletions=eval_result["deletions"],
+                insertions=eval_result["insertions"],
+                reference_words=eval_result["reference_words"],
+                errors=trace.errors,
+                normalized_reference=eval_result.get("normalized_reference"),
+                normalized_hypothesis=eval_result.get("normalized_hypothesis"),
+                judge=self.judge,
+                timestamp=datetime.now(UTC),
+            )
 
-                # Store metrics
-                await self.db.insert_wer_metrics(metrics)
-                results.append(metrics)
+            # Store metrics
+            await self.db.insert_wer_metrics(metrics)
+            results.append(metrics)
 
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, len(samples), sample.sample_id)
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(samples), sample.sample_id)
 
-                logger.debug(
-                    f"[{completed}/{len(samples)}] {sample.sample_id}: WER={metrics.wer:.2%}"
-                )
+            logger.debug(f"[{completed}/{len(samples)}] {sample.sample_id}: WER={metrics.wer:.2%}")
 
         await asyncio.gather(*(_eval_sample(sample) for sample in samples))
 

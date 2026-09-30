@@ -188,6 +188,11 @@ class WERMetrics(BaseModel):
         default=None, description="Claude-normalized hypothesis text"
     )
 
+    judge: str | None = Field(
+        default=None,
+        description="Judge configuration that produced this result (None if not recorded)",
+    )
+
     timestamp: datetime = Field(default_factory=_utcnow)
 
 
@@ -224,9 +229,7 @@ class SemanticWERTrace(BaseModel):
     # Performance metrics
     duration_ms: int | None = Field(default=None, description="Total evaluation time")
     num_turns: int = Field(default=1, description="Number of conversation turns")
-    model_used: str = Field(
-        default="claude-sonnet-4-5-20250929", description="Model used for evaluation"
-    )
+    model_used: str = Field(description="Model used for evaluation")
 
     timestamp: datetime = Field(default_factory=_utcnow)
 
