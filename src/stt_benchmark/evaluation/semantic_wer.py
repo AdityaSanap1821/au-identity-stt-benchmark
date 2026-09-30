@@ -397,12 +397,16 @@ class SemanticWEREvaluator:
     """Semantic WER evaluator using Claude with tool use.
 
     Adapted from asr_eval AgentSDKJudge.
+
+    ``effort=None`` runs the judge without thinking at temperature 0, the
+    setup for models that predate adaptive thinking (such as the Claude
+    Sonnet 4.5 judge), so earlier scores can be reproduced for comparison.
     """
 
     def __init__(
         self,
         model: str = DEFAULT_JUDGE_MODEL,
-        effort: str = DEFAULT_JUDGE_EFFORT,
+        effort: str | None = DEFAULT_JUDGE_EFFORT,
         repeats: int = DEFAULT_JUDGE_REPEATS,
         db_path: Path | None = None,
         max_concurrency: int = 50,
@@ -424,18 +428,23 @@ class SemanticWEREvaluator:
     @property
     def judge(self) -> str:
         """Label identifying this judge configuration, stored with each result."""
-        return (
-            f"{self.model} effort={self.effort} repeats={self.repeats} prompt={PROMPT_FINGERPRINT}"
-        )
+        sampling = f"effort={self.effort}" if self.effort else "temperature=0"
+        return f"{self.model} {sampling} repeats={self.repeats} prompt={PROMPT_FINGERPRINT}"
 
     def _request(self, messages: list[dict], max_tokens: int) -> dict:
         """Build a request payload with the judge's model, thinking, and effort settings."""
+        if self.effort:
+            # "summarized" keeps the model's reasoning readable in the stored trace.
+            sampling = {
+                "thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"effort": self.effort},
+            }
+        else:
+            sampling = {"temperature": 0}
         return {
             "model": self.model,
             "max_tokens": max_tokens,
-            # "summarized" keeps the model's reasoning readable in the stored trace.
-            "thinking": {"type": "adaptive", "display": "summarized"},
-            "output_config": {"effort": self.effort},
+            **sampling,
             "system": [
                 {
                     "type": "text",

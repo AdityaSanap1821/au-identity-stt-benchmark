@@ -185,7 +185,7 @@ Traditional WER penalizes every word difference equally. "gonna" vs "going to" c
 
 This gives accuracy metrics that reflect real-world impact on downstream LLM applications.
 
-The judge is Claude Sonnet 5.5 with adaptive thinking at `medium` effort, configured in [`semantic_wer.py`](src/stt_benchmark/evaluation/semantic_wer.py). Each result records the judge that produced it, and `stt-benchmark wer` won't add results to a service that another judge scored, since the two sets of scores aren't comparable. After changing the judge, re-score with `--force-recalculate`. To compare judge settings before re-scoring, use [`scripts/judge_consistency.py`](scripts/README.md#judge-consistency).
+The judge is Claude Sonnet 5.5 with adaptive thinking at `medium` effort, configured in [`semantic_wer.py`](src/stt_benchmark/evaluation/semantic_wer.py). Each result records the judge that produced it, and `stt-benchmark wer` won't add results to a service that another judge scored, since the two sets of scores aren't comparable. After changing the judge, re-score with `--force-recalculate`. To measure a judge before re-scoring with it, use the [judge experiment scripts](scripts/README.md#judge-experiments).
 
 ## Supported Services
 

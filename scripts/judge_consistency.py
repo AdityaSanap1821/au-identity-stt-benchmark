@@ -1,190 +1,129 @@
 #!/usr/bin/env python3
-"""Compare semantic WER judge configurations before re-scoring the benchmark.
+"""Measure how consistently semantic WER judges score the same transcription.
 
-Picks a random set of (sample, service) transcriptions, judges each one
-several times per effort level, and reports how much the judge disagrees
-with itself between runs, how far it lands from the stored scores, what
-fraction of runs fail, and what a full re-score would cost. Nothing is
-written to the results database.
+Judges a set of transcriptions several times with each judge and reports how
+often the runs agree, how much judge noise that adds to a service's mean WER,
+and how closely each judge matches the stored scores. Half the transcriptions
+are ones the stored judge found errors in, since those are the ones judges
+disagree on. Nothing is written to the results database; every judgment is
+logged to ``runs.jsonl`` in the output directory, and re-running the same
+command resumes from it.
 
 Usage:
     uv run python scripts/judge_consistency.py
-    uv run python scripts/judge_consistency.py --pairs 100 --repeats 3 --efforts medium high
+    uv run python scripts/judge_consistency.py --pairs 200 --repeats 5 \\
+        --judges claude-sonnet-5-5:medium claude-sonnet-5-5:high
 """
 
 import argparse
 import asyncio
 import json
+import math
 import random
-import sqlite3
 import statistics
-from datetime import UTC, datetime
 from pathlib import Path
 
-from rich.console import Console
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
+from judge_common import console, judgment_cost, load_pairs, pair_key, parse_judge, run_judgments
 from rich.table import Table
 
 from stt_benchmark.config import get_config
-from stt_benchmark.evaluation.semantic_wer import DEFAULT_JUDGE_MODEL, SemanticWEREvaluator
-from stt_benchmark.models import ServiceName
 
-# Claude Sonnet 5.5 prices in USD per million tokens (5-minute cache writes).
-PRICE_PER_MTOK = {
-    "input_tokens": 2.00,
-    "output_tokens": 10.00,
-    "cache_read_input_tokens": 0.20,
-    "cache_creation_input_tokens": 2.50,
-}
-
-console = Console()
+DEFAULT_JUDGES = [
+    "claude-sonnet-4-5-20250929:none",
+    "claude-sonnet-5-5:medium",
+    "claude-sonnet-5-5:high",
+]
+SERVICE_SAMPLES = 1000
 
 
-def load_pairs(db_path: Path) -> list[dict]:
-    """Load every transcription that has ground truth, with its stored WER if any."""
-    services = {s.value for s in ServiceName}
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT r.sample_id, r.service_name, r.model_name, r.transcription,
-               gt.text AS reference, w.wer AS stored_wer
-        FROM results r
-        JOIN ground_truth gt ON gt.sample_id = r.sample_id
-        LEFT JOIN wer_metrics w ON w.sample_id = r.sample_id
-            AND w.service_name = r.service_name AND w.model_name = r.model_name
-        WHERE r.transcription IS NOT NULL AND trim(r.transcription) != ''
-            AND trim(gt.text) != ''
-        ORDER BY r.service_name, r.sample_id
-        """
-    ).fetchall()
-    conn.close()
-    return [dict(row) for row in rows if row["service_name"] in services]
+def pick_pairs(all_pairs: list[dict], count: int, seed: int) -> list[dict]:
+    """Pick ``count`` pairs, half with stored errors and half without."""
+    rng = random.Random(seed)
+    with_errors = [p for p in all_pairs if (p["stored_error_count"] or 0) > 0]
+    without = [p for p in all_pairs if p["stored_error_count"] == 0]
+    half = count // 2
+    return rng.sample(with_errors, min(half, len(with_errors))) + rng.sample(
+        without, min(count - half, len(without))
+    )
 
 
-async def judge_pairs(effort: str, pairs: list[dict], repeats: int, db_path: Path) -> dict:
-    """Judge every pair ``repeats`` times at one effort level."""
-    evaluator = SemanticWEREvaluator(model=DEFAULT_JUDGE_MODEL, effort=effort, db_path=db_path)
-    await evaluator.warm_cache()
-
-    with Progress(
-        TextColumn(f"effort={effort}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("judging", total=len(pairs) * repeats)
-
-        async def judge_once(pair: dict) -> dict | None:
-            outcome = await evaluator.evaluate_with_retry(
-                pair["reference"], pair["transcription"], filename=pair["sample_id"]
-            )
-            progress.advance(task)
-            if outcome is None:
-                return None
-            result, _ = outcome
-            return {
-                "wer": result["wer"],
-                "errors": result["substitutions"] + result["deletions"] + result["insertions"],
-                "reference_words": result["reference_words"],
-            }
-
-        runs = await asyncio.gather(
-            *(asyncio.gather(*(judge_once(pair) for _ in range(repeats))) for pair in pairs)
-        )
-
-    return {"judge": evaluator.judge, "runs": [list(r) for r in runs], "usage": evaluator.usage}
-
-
-def summarize(pairs: list[dict], judged: dict, total_pairs: int) -> dict:
-    """Reduce one effort level's runs to comparison statistics."""
-    runs = judged["runs"]
-    num_runs = sum(len(r) for r in runs)
-    failed = sum(run is None for r in runs for run in r)
-    complete = [(pair, r) for pair, r in zip(pairs, runs, strict=True) if None not in r]
-
-    medians, spreads, identical, stored_diffs = [], [], 0, []
-    errors_total = words_total = 0
-    for pair, r in complete:
+def summarize(pairs: list[dict], runs: dict, error_share: float) -> dict:
+    """Reduce one judge's runs to consistency statistics, per stratum."""
+    strata = {"with errors": [], "without errors": []}
+    failed = total = 0
+    for pair in pairs:
+        r = runs[pair_key(pair)]
+        total += len(r)
+        failed += sum(run is None for run in r)
+        if None in r:
+            continue
+        stratum = "with errors" if pair["stored_error_count"] else "without errors"
         by_wer = sorted(r, key=lambda run: run["wer"])
         median = by_wer[len(by_wer) // 2]
-        medians.append(median["wer"])
-        errors_total += median["errors"]
-        words_total += median["reference_words"]
-        spreads.append(by_wer[-1]["wer"] - by_wer[0]["wer"])
-        identical += len({run["errors"] for run in r}) == 1
-        if pair["stored_wer"] is not None:
-            stored_diffs.append(median["wer"] - pair["stored_wer"])
+        strata[stratum].append(
+            {
+                "identical": len({run["error_count"] for run in r}) == 1,
+                "variance": statistics.pvariance([run["wer"] for run in r]),
+                "matches_stored": median["error_count"] == pair["stored_error_count"],
+                "abs_diff_stored": abs(median["wer"] - pair["stored_wer"]),
+            }
+        )
 
-    usage = judged["usage"]
-    succeeded = max(num_runs - failed, 1)
-    cost = sum(usage[k] * price / 1_000_000 for k, price in PRICE_PER_MTOK.items())
-    cost_per_judgment = cost / succeeded
+    summary = {"failed_runs": f"{failed}/{total}"}
+    for name, items in strata.items():
+        summary[name] = {
+            "n": len(items),
+            "identical": statistics.mean(i["identical"] for i in items) if items else None,
+            "sd": math.sqrt(statistics.mean(i["variance"] for i in items)) if items else None,
+            "matches_stored": (
+                statistics.mean(i["matches_stored"] for i in items) if items else None
+            ),
+            "abs_diff_stored": (
+                statistics.mean(i["abs_diff_stored"] for i in items) if items else None
+            ),
+        }
+    # Judge noise on a service's mean WER, weighting each stratum by its share
+    # of all transcriptions.
+    sd_with, sd_without = summary["with errors"]["sd"], summary["without errors"]["sd"]
+    if sd_with is not None and sd_without is not None:
+        variance = error_share * sd_with**2 + (1 - error_share) * sd_without**2
+        summary["service_mean_noise_95"] = 1.96 * math.sqrt(variance / SERVICE_SAMPLES)
+    else:
+        summary["service_mean_noise_95"] = None
+    return summary
 
-    return {
-        "judge": judged["judge"],
-        "failed_runs": f"{failed}/{num_runs}",
-        "mean_wer": statistics.mean(medians) if medians else None,
-        "pooled_wer": errors_total / words_total if words_total else None,
-        "identical_repeats": identical / len(complete) if complete else None,
-        "mean_repeat_spread": statistics.mean(spreads) if spreads else None,
-        "max_repeat_spread": max(spreads) if spreads else None,
-        "mean_abs_diff_vs_stored": (
-            statistics.mean(abs(d) for d in stored_diffs) if stored_diffs else None
-        ),
-        "mean_diff_vs_stored": statistics.mean(stored_diffs) if stored_diffs else None,
-        "output_tokens_per_judgment": usage["output_tokens"] / succeeded,
-        "cost_per_judgment": cost_per_judgment,
-        "full_rescore_cost_1x": cost_per_judgment * total_pairs,
-        "full_rescore_cost_3x": cost_per_judgment * total_pairs * 3,
-        "medians": medians,
-    }
 
-
-def fmt(value, kind: str) -> str:
-    if value is None:
-        return "-"
-    if kind == "pct":
-        return f"{value:.2%}"
-    if kind == "usd":
-        return f"${value:,.2f}"
-    if kind == "int":
-        return f"{value:,.0f}"
-    return str(value)
+def pct(value) -> str:
+    return "-" if value is None else f"{value:.1%}"
 
 
 def print_summary(summaries: dict[str, dict], repeats: int) -> None:
-    table = Table(title=f"Judge comparison ({repeats} runs per transcription)")
+    table = Table(title=f"Judge consistency ({repeats} runs per transcription)")
     table.add_column("Metric", style="cyan")
-    for effort in summaries:
-        table.add_column(f"effort={effort}", justify="right")
+    for judge in summaries:
+        table.add_column(judge, justify="right")
 
-    rows = [
-        ("Failed runs", "failed_runs", "str"),
-        ("Mean WER (median run)", "mean_wer", "pct"),
-        ("Pooled WER (median run)", "pooled_wer", "pct"),
-        ("Identical error counts across runs", "identical_repeats", "pct"),
-        ("Mean WER spread across runs", "mean_repeat_spread", "pct"),
-        ("Max WER spread across runs", "max_repeat_spread", "pct"),
-        ("Mean |diff| vs stored score", "mean_abs_diff_vs_stored", "pct"),
-        ("Mean diff vs stored score", "mean_diff_vs_stored", "pct"),
-        ("Output tokens per judgment", "output_tokens_per_judgment", "int"),
-        ("Cost per judgment", "cost_per_judgment", "usd"),
-        ("Full re-score, 1 run each", "full_rescore_cost_1x", "usd"),
-        ("Full re-score, 3 runs each", "full_rescore_cost_3x", "usd"),
-    ]
-    for label, key, kind in rows:
-        table.add_row(label, *(fmt(s[key], kind) for s in summaries.values()))
+    def row(label, get):
+        table.add_row(label, *(get(s) for s in summaries.values()))
+
+    row("Failed runs", lambda s: s["failed_runs"])
+    for stratum in ("with errors", "without errors"):
+        row(f"[bold]Stored {stratum}[/bold] (n)", lambda s, k=stratum: str(s[k]["n"]))
+        row("  Same error count every run", lambda s, k=stratum: pct(s[k]["identical"]))
+        row("  WER std dev across runs", lambda s, k=stratum: pct(s[k]["sd"]))
+        row("  Error count matches stored", lambda s, k=stratum: pct(s[k]["matches_stored"]))
+        row("  Mean |WER diff| vs stored", lambda s, k=stratum: pct(s[k]["abs_diff_stored"]))
+    row(
+        f"Noise in a {SERVICE_SAMPLES:,}-sample mean (95%)",
+        lambda s: (
+            "-" if s["service_mean_noise_95"] is None else f"±{s['service_mean_noise_95']:.2%}"
+        ),
+    )
+    row(
+        "Cost per judgment",
+        lambda s: "-" if s["cost_per_judgment"] is None else f"${s['cost_per_judgment']:.4f}",
+    )
     console.print(table)
-
-    efforts = list(summaries)
-    for i, a in enumerate(efforts):
-        for b in efforts[i + 1 :]:
-            ma, mb = summaries[a]["medians"], summaries[b]["medians"]
-            if len(ma) == len(mb) and ma:
-                diff = statistics.mean(abs(x - y) for x, y in zip(ma, mb, strict=True))
-                console.print(f"Mean |diff| between {a} and {b}: {diff:.2%}")
 
 
 async def main() -> None:
@@ -192,55 +131,46 @@ async def main() -> None:
     parser.add_argument("--pairs", type=int, default=100, help="Transcriptions to judge")
     parser.add_argument("--repeats", type=int, default=3, help="Runs per transcription")
     parser.add_argument(
-        "--efforts", nargs="+", default=["medium", "high"], help="Effort levels to compare"
+        "--judges",
+        nargs="+",
+        default=DEFAULT_JUDGES,
+        help="Judges as model:effort; effort 'none' means no thinking at temperature 0",
     )
     parser.add_argument("--seed", type=int, default=0, help="Seed for picking transcriptions")
     parser.add_argument("--test", action="store_true", help="Use test_results.db")
-    parser.add_argument("--output", type=Path, help="Where to write the raw runs as JSON")
+    parser.add_argument("--output-dir", type=Path, help="Where to write runs and the summary")
     args = parser.parse_args()
 
     config = get_config()
     db_path = config.data_dir / "test_results.db" if args.test else config.results_db
-
-    all_pairs = load_pairs(db_path)
-    pairs = random.Random(args.seed).sample(all_pairs, min(args.pairs, len(all_pairs)))
-    console.print(
-        f"Judging {len(pairs)} of {len(all_pairs)} transcriptions,"
-        f" {args.repeats} runs each, efforts: {', '.join(args.efforts)}\n"
+    output_dir = args.output_dir or config.data_dir / "judge_experiments" / (
+        f"consistency_n{args.pairs}_r{args.repeats}_s{args.seed}"
     )
 
-    judged, summaries = {}, {}
-    for effort in args.efforts:
-        judged[effort] = await judge_pairs(effort, pairs, args.repeats, db_path)
-        summaries[effort] = summarize(pairs, judged[effort], len(all_pairs))
+    all_pairs = [p for p in load_pairs(db_path) if p["stored_error_count"] is not None]
+    error_share = statistics.mean((p["stored_error_count"] or 0) > 0 for p in all_pairs)
+    pairs = pick_pairs(all_pairs, args.pairs, args.seed)
+    console.print(
+        f"Judging {len(pairs)} transcriptions ({error_share:.0%} of all stored scores have"
+        f" errors), {args.repeats} runs each\n"
+    )
+
+    summaries = {}
+    for spec in args.judges:
+        model, effort = parse_judge(spec)
+        runs, evaluator, new_judgments = await run_judgments(
+            model, effort, pairs, args.repeats, output_dir / "runs.jsonl", db_path
+        )
+        summary = summarize(pairs, runs, error_share)
+        summary["cost_per_judgment"] = (
+            judgment_cost(evaluator) / new_judgments if new_judgments else None
+        )
+        summaries[evaluator.judge.split(" repeats=")[0]] = summary
 
     console.print()
     print_summary(summaries, args.repeats)
-
-    output = args.output or config.data_dir / (
-        f"judge_consistency_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.json"
-    )
-    output.write_text(
-        json.dumps(
-            {
-                "pairs": [
-                    {k: pair[k] for k in ("sample_id", "service_name", "model_name", "stored_wer")}
-                    for pair in pairs
-                ],
-                "efforts": {
-                    effort: {
-                        "judge": judged[effort]["judge"],
-                        "runs": judged[effort]["runs"],
-                        "usage": dict(judged[effort]["usage"]),
-                        "summary": {k: v for k, v in summaries[effort].items() if k != "medians"},
-                    }
-                    for effort in args.efforts
-                },
-            },
-            indent=2,
-        )
-    )
-    console.print(f"\nRaw runs written to {output}")
+    (output_dir / "summary.json").write_text(json.dumps(summaries, indent=2))
+    console.print(f"\nRuns and summary written to {output_dir}")
 
 
 if __name__ == "__main__":

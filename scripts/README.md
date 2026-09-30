@@ -63,22 +63,46 @@ A JSON file that stores plot settings for repeatable generation. See `plot-confi
 
 All keys are optional. Omitted keys fall back to defaults.
 
-## Judge Consistency
+## Judge Experiments
 
-`judge_consistency.py` compares semantic WER judge settings before a full re-score. It picks a random set of transcriptions, judges each one several times per effort level, and reports failed runs, how often repeated runs agree, the difference from the stored scores, and the projected cost of a full re-score. It writes the raw runs to a JSON file and leaves the results database untouched.
+Two scripts measure a semantic WER judge before the benchmark is re-scored with it. Neither writes to the results database: each logs every judgment to `runs.jsonl` in its output directory (under `stt_benchmark_data/judge_experiments/` by default), and re-running the same command resumes from the log. Judges are given as `model:effort`, where an effort of `none` runs without thinking at temperature 0, the setup of the Claude Sonnet 4.5 judge.
+
+### Consistency
+
+`judge_consistency.py` judges a set of transcriptions several times with each judge. Half are transcriptions the stored judge found errors in. It reports how often repeated runs agree, how much judge noise that adds to a 1,000-sample mean WER, and how closely each judge matches the stored scores.
 
 ```bash
-# 100 transcriptions, 3 runs each, at medium and high effort
+# 100 transcriptions, 3 runs each: Sonnet 4.5 (the stored judge), Sonnet 5.5 at medium and high
 uv run python scripts/judge_consistency.py
 
-uv run python scripts/judge_consistency.py --pairs 50 --repeats 5 --efforts low medium
+uv run python scripts/judge_consistency.py --pairs 200 --repeats 5 --judges claude-sonnet-5-5:medium
 ```
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--pairs` | Transcriptions to judge | `100` |
 | `--repeats` | Runs per transcription | `3` |
-| `--efforts` | Effort levels to compare (space-separated) | `medium high` |
+| `--judges` | Judges to compare (space-separated `model:effort`) | Sonnet 4.5, Sonnet 5.5 `medium` and `high` |
 | `--seed` | Seed for picking transcriptions | `0` |
 | `--test` | Use `test_results.db` | off |
-| `--output` | Path for the raw runs JSON | `stt_benchmark_data/judge_consistency_<timestamp>.json` |
+| `--output-dir` | Where to write runs and the summary | `judge_experiments/consistency_*` |
+
+### Impact
+
+`judge_impact.py` re-judges every transcription for the chosen services and compares the result with the stored scores: mean and pooled WER per service with a 95% confidence interval on the change, the ranking, and the gaps between neighbouring services. It writes the largest disagreements to `disagreements.md` for manual review.
+
+```bash
+uv run python scripts/judge_impact.py --services meta,azure,soniox,deepgram,mistral
+
+# Trial run on the first 10 transcriptions per service
+uv run python scripts/judge_impact.py --services meta,azure --limit 10
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--services` | Comma-separated services to re-judge | required |
+| `--judge` | New judge as `model:effort` | `claude-sonnet-5-5:medium` |
+| `--review` | Disagreements to write out | `40` |
+| `--limit` | Judge only the first N transcriptions per service | all |
+| `--test` | Use `test_results.db` | off |
+| `--output-dir` | Where to write runs and the report | `judge_experiments/impact_*` |
