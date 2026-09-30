@@ -103,6 +103,7 @@ class Database:
                 errors TEXT,
                 normalized_reference TEXT,
                 normalized_hypothesis TEXT,
+                judge TEXT,
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (sample_id) REFERENCES samples(sample_id),
                 UNIQUE(sample_id, service_name, model_name)
@@ -163,6 +164,13 @@ class Database:
         try:
             await self._conn.execute("ALTER TABLE ground_truth ADD COLUMN original_text TEXT")
             logger.debug("Added original_text column to ground_truth")
+        except Exception:
+            pass  # Column already exists
+
+        # Migration: Record which judge produced each WER result
+        try:
+            await self._conn.execute("ALTER TABLE wer_metrics ADD COLUMN judge TEXT")
+            logger.debug("Added judge column to wer_metrics")
         except Exception:
             pass  # Column already exists
 
@@ -577,8 +585,8 @@ class Database:
             INSERT OR REPLACE INTO wer_metrics
             (sample_id, service_name, model_name, wer, substitutions,
              deletions, insertions, reference_words, errors,
-             normalized_reference, normalized_hypothesis, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             normalized_reference, normalized_hypothesis, judge, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metrics.sample_id,
@@ -592,6 +600,7 @@ class Database:
                 errors_json,
                 metrics.normalized_reference,
                 metrics.normalized_hypothesis,
+                metrics.judge,
                 metrics.timestamp.isoformat(),
             ),
         )
@@ -699,8 +708,30 @@ class Database:
             errors=errors,
             normalized_reference=row["normalized_reference"],
             normalized_hypothesis=row["normalized_hypothesis"],
+            judge=row["judge"],
             timestamp=datetime.fromisoformat(row["timestamp"]),
         )
+
+    async def get_wer_judge_counts(
+        self, service_name: ServiceName, model_name: str | None = None
+    ) -> dict[str | None, int]:
+        """Count a service's WER results by the judge that produced them.
+
+        Returns:
+            Mapping of judge label (None where it wasn't recorded) to result count.
+        """
+        if model_name:
+            cursor = await self._conn.execute(
+                "SELECT judge, COUNT(*) FROM wer_metrics"
+                " WHERE service_name = ? AND model_name = ? GROUP BY judge",
+                (service_name.value, model_name),
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT judge, COUNT(*) FROM wer_metrics WHERE service_name = ? GROUP BY judge",
+                (service_name.value,),
+            )
+        return {row[0]: row[1] for row in await cursor.fetchall()}
 
     # ========== Semantic WER Trace Operations ==========
 

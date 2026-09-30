@@ -13,9 +13,11 @@ and responds to the user. Full reasoning traces are stored for debugging.
 """
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -352,6 +354,44 @@ CALCULATE_WER_TOOL = {
     },
 }
 
+USER_PROMPT_TEMPLATE = """Please calculate the Word Error Rate (WER) for this ASR transcription.
+
+**Reference (ground truth):**
+{reference}
+
+**Hypothesis (ASR transcription):**
+{hypothesis}
+
+Follow the process: NORMALIZE → ALIGN → COUNT → VERIFY → CALCULATE
+
+Show your work clearly, then call calculate_wer with your verified counts."""
+
+# The judge configuration. Scores from different judges aren't comparable, so
+# every stored result records the judge that produced it (see
+# ``SemanticWEREvaluator.judge``) and the ``wer`` command refuses to mix judges
+# within a service. Changing any of these requires re-scoring every service.
+DEFAULT_JUDGE_MODEL = "claude-sonnet-5-5"
+# At "low" the model decides per request whether to think, so easy and hard
+# transcripts would be judged differently; from "medium" up it thinks on
+# nearly every request.
+DEFAULT_JUDGE_EFFORT = "medium"
+# Number of independent judgments per sample; the median one is stored.
+DEFAULT_JUDGE_REPEATS = 1
+
+# Identifies the prompts and tool definition, so edits to them also count as a
+# different judge.
+PROMPT_FINGERPRINT = hashlib.sha256(
+    (
+        SEMANTIC_WER_SYSTEM_PROMPT
+        + USER_PROMPT_TEMPLATE
+        + json.dumps(CALCULATE_WER_TOOL, sort_keys=True)
+    ).encode()
+).hexdigest()[:8]
+
+
+class JudgeError(Exception):
+    """The judge finished without producing a WER result."""
+
 
 class SemanticWEREvaluator:
     """Semantic WER evaluator using Claude with tool use.
@@ -361,43 +401,74 @@ class SemanticWEREvaluator:
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-5-20250929",
+        model: str = DEFAULT_JUDGE_MODEL,
+        effort: str = DEFAULT_JUDGE_EFFORT,
+        repeats: int = DEFAULT_JUDGE_REPEATS,
         db_path: Path | None = None,
         max_concurrency: int = 50,
     ):
         self.config = get_config()
         self.model = model
+        self.effort = effort
+        self.repeats = repeats
         self.db = Database(db_path=db_path)
         self._api_semaphore = asyncio.Semaphore(max_concurrency)
+        # Running token totals across every API call this evaluator makes.
+        self.usage: Counter[str] = Counter()
 
         if not self.config.anthropic_api_key:
             raise ValueError("ANTHROPIC_API_KEY not set in environment")
 
         self.client = anthropic.AsyncAnthropic(api_key=self.config.anthropic_api_key)
 
-    async def warm_cache(self) -> None:
-        """Send a minimal request to warm the prompt cache.
+    @property
+    def judge(self) -> str:
+        """Label identifying this judge configuration, stored with each result."""
+        return (
+            f"{self.model} effort={self.effort} repeats={self.repeats} prompt={PROMPT_FINGERPRINT}"
+        )
 
-        Establishes the cache for the system prompt and tool definition
-        before any real evaluation requests are sent.  This ensures all
-        concurrent evaluation requests get cache hits.
-        """
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=1,
-            system=[
+    def _request(self, messages: list[dict], max_tokens: int) -> dict:
+        """Build a request payload with the judge's model, thinking, and effort settings."""
+        return {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            # "summarized" keeps the model's reasoning readable in the stored trace.
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": self.effort},
+            "system": [
                 {
                     "type": "text",
                     "text": SEMANTIC_WER_SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            tools=[CALCULATE_WER_TOOL],
-            messages=[{"role": "user", "content": "."}],
+            "tools": [CALCULATE_WER_TOOL],
+            "messages": messages,
+        }
+
+    async def warm_cache(self) -> None:
+        """Send a minimal request to warm the prompt cache.
+
+        Establishes the cache for the system prompt and tool definition
+        before any real evaluation requests are sent.  This ensures all
+        concurrent evaluation requests get cache hits.  ``max_tokens=0``
+        writes the cache without generating output; the thinking and
+        effort settings must match the real requests for them to hit it.
+        """
+        response = await self.client.messages.create(
+            **self._request([{"role": "user", "content": "."}], max_tokens=0)
         )
         logger.info(
             f"Prompt cache warmed ({getattr(response.usage, 'cache_creation_input_tokens', 0) or 0:,} tokens written)"
         )
+
+    def _record_usage(self, response: anthropic.types.Message) -> None:
+        usage = response.usage
+        self.usage["input_tokens"] += usage.input_tokens
+        self.usage["output_tokens"] += usage.output_tokens
+        self.usage["cache_read_input_tokens"] += usage.cache_read_input_tokens or 0
+        self.usage["cache_creation_input_tokens"] += usage.cache_creation_input_tokens or 0
 
     async def _api_call(
         self,
@@ -405,15 +476,16 @@ class SemanticWEREvaluator:
         filename: str,
         max_retries: int = 5,
     ) -> anthropic.types.Message:
-        """Make a single API call with concurrency control and retry.
+        """Make a single API call with retry.
 
-        Acquires the global semaphore before calling the API, and retries
-        on rate-limit (429) and server (5xx) errors with exponential
-        backoff.
+        Retries on rate-limit (429) and server (5xx) errors with
+        exponential backoff.
         """
         for attempt in range(1, max_retries + 1):
             try:
-                return await self.client.messages.create(**request_payload)
+                response = await self.client.messages.create(**request_payload)
+                self._record_usage(response)
+                return response
             except (
                 anthropic.RateLimitError,
                 anthropic.InternalServerError,
@@ -482,18 +554,7 @@ class SemanticWEREvaluator:
         if not hypothesis.strip():
             return self._no_hypothesis_result(reference, session_id, start_time)
 
-        # Build the user prompt
-        user_prompt = f"""Please calculate the Word Error Rate (WER) for this ASR transcription.
-
-**Reference (ground truth):**
-{reference}
-
-**Hypothesis (ASR transcription):**
-{hypothesis}
-
-Follow the process: NORMALIZE → ALIGN → COUNT → VERIFY → CALCULATE
-
-Show your work clearly, then call calculate_wer with your verified counts."""
+        user_prompt = USER_PROMPT_TEMPLATE.format(reference=reference, hypothesis=hypothesis)
 
         # Initialize conversation
         messages = [{"role": "user", "content": user_prompt}]
@@ -508,23 +569,7 @@ Show your work clearly, then call calculate_wer with your verified counts."""
             num_turns += 1
 
             try:
-                response = await self._api_call(
-                    {
-                        "model": self.model,
-                        "max_tokens": 4096,
-                        "temperature": 0,
-                        "system": [
-                            {
-                                "type": "text",
-                                "text": SEMANTIC_WER_SYSTEM_PROMPT,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ],
-                        "tools": [CALCULATE_WER_TOOL],
-                        "messages": messages,
-                    },
-                    filename,
-                )
+                response = await self._api_call(self._request(messages, max_tokens=16000), filename)
             except Exception as e:
                 logger.error(f"Error calling Claude API: {e}")
                 raise
@@ -532,7 +577,9 @@ Show your work clearly, then call calculate_wer with your verified counts."""
             # Record the assistant's response
             assistant_content = []
             for block in response.content:
-                if block.type == "text":
+                if block.type == "thinking" and block.thinking:
+                    assistant_content.append({"type": "thinking", "thinking": block.thinking})
+                elif block.type == "text":
                     assistant_content.append({"type": "text", "text": block.text})
                 elif block.type == "tool_use":
                     assistant_content.append(
@@ -552,13 +599,14 @@ Show your work clearly, then call calculate_wer with your verified counts."""
                 }
             )
 
-            # Check if we're done
-            if response.stop_reason == "end_turn":
-                # Model finished without calling tool - this shouldn't happen
-                logger.warning("Model finished without calling calculate_wer")
-                break
+            # Anything but a tool call (finishing without calling calculate_wer,
+            # running out of tokens, or a refusal) leaves no result to store.
+            if response.stop_reason != "tool_use":
+                reason = response.stop_reason
+                if reason == "refusal" and response.stop_details:
+                    reason = f"refusal ({response.stop_details.category})"
+                raise JudgeError(f"judge stopped without a result: {reason}")
 
-            # Handle tool use
             if response.stop_reason == "tool_use":
                 tool_results = []
 
@@ -613,21 +661,7 @@ Show your work clearly, then call calculate_wer with your verified counts."""
                     # Get final response after tool result
                     try:
                         final_response = await self._api_call(
-                            {
-                                "model": self.model,
-                                "max_tokens": 1024,
-                                "temperature": 0,
-                                "system": [
-                                    {
-                                        "type": "text",
-                                        "text": SEMANTIC_WER_SYSTEM_PROMPT,
-                                        "cache_control": {"type": "ephemeral"},
-                                    }
-                                ],
-                                "tools": [CALCULATE_WER_TOOL],
-                                "messages": messages,
-                            },
-                            filename,
+                            self._request(messages, max_tokens=4096), filename
                         )
 
                         final_content = []
@@ -647,11 +681,14 @@ Show your work clearly, then call calculate_wer with your verified counts."""
 
                     break
 
+        if result is None:
+            raise JudgeError(f"judge did not call calculate_wer within {max_turns} turns")
+
         duration_ms = int((time.time() - start_time) * 1000)
 
         # Convert errors to SemanticError objects
         errors = None
-        if result and result.get("errors"):
+        if result.get("errors"):
             errors = [
                 SemanticError(
                     error_type=e.get("type", "substitution"),
@@ -669,20 +706,20 @@ Show your work clearly, then call calculate_wer with your verified counts."""
             session_id=session_id,
             conversation_trace=conversation_trace,
             tool_calls=tool_calls,
-            normalized_reference=result.get("normalized_reference") if result else None,
-            normalized_hypothesis=result.get("normalized_hypothesis") if result else None,
-            wer=result["wer"] if result else 0.0,
-            substitutions=result["substitutions"] if result else 0,
-            deletions=result["deletions"] if result else 0,
-            insertions=result["insertions"] if result else 0,
-            reference_words=result["reference_words"] if result else 0,
+            normalized_reference=result.get("normalized_reference"),
+            normalized_hypothesis=result.get("normalized_hypothesis"),
+            wer=result["wer"],
+            substitutions=result["substitutions"],
+            deletions=result["deletions"],
+            insertions=result["insertions"],
+            reference_words=result["reference_words"],
             errors=errors,
             duration_ms=duration_ms,
             num_turns=num_turns,
             model_used=self.model,
         )
 
-        return result or {"wer": 0.0}, trace
+        return result, trace
 
     def _empty_result(self, session_id: str, start_time: float) -> tuple[dict, SemanticWERTrace]:
         """Handle case where both texts are empty."""
@@ -776,29 +813,56 @@ Show your work clearly, then call calculate_wer with your verified counts."""
         max_retries: int = 3,
         timeout_secs: float = 5 * 60,
     ) -> tuple[dict, SemanticWERTrace] | None:
-        """Evaluate with timeout and retry logic.
+        """Evaluate with concurrency control, timeout, and retry logic.
 
         Transient API errors (429, 5xx) are handled per-call inside
-        ``_api_call``.  This method handles overall timeouts and
-        unexpected errors.  Returns None if all attempts fail.
+        ``_api_call``.  This method retries timeouts and judge runs that
+        ended without a result, and gives up on unexpected errors.
+        Returns None if all attempts fail.
         """
         for attempt in range(1, max_retries + 1):
             try:
-                return await asyncio.wait_for(
-                    self.evaluate(reference, hypothesis, filename=filename),
-                    timeout=timeout_secs,
-                )
+                async with self._api_semaphore:
+                    return await asyncio.wait_for(
+                        self.evaluate(reference, hypothesis, filename=filename),
+                        timeout=timeout_secs,
+                    )
             except TimeoutError:
                 logger.warning(
                     f"{filename}: timed out after {timeout_secs}s (attempt {attempt}/{max_retries})"
                 )
-                if attempt == max_retries:
-                    logger.error(f"{filename}: failed after {max_retries} timeout retries")
+            except JudgeError as e:
+                logger.warning(f"{filename}: {e} (attempt {attempt}/{max_retries})")
             except Exception as e:
                 logger.error(f"{filename}: evaluation error: {e}")
-                break
+                return None
 
+        logger.error(f"{filename}: failed after {max_retries} attempts")
         return None
+
+    async def evaluate_repeated(
+        self,
+        reference: str,
+        hypothesis: str,
+        filename: str = "",
+    ) -> tuple[dict, SemanticWERTrace] | None:
+        """Judge a transcription ``self.repeats`` times and return the median judgment.
+
+        The judge doesn't give identical answers on every run, so the run
+        with the median WER is kept to damp that noise.  Returns None
+        unless every run succeeds, so a stored result always reflects the
+        full set of runs.
+        """
+        pairs = await asyncio.gather(
+            *(
+                self.evaluate_with_retry(reference, hypothesis, filename=filename)
+                for _ in range(self.repeats)
+            )
+        )
+        if any(pair is None for pair in pairs):
+            return None
+        pairs.sort(key=lambda pair: pair[0]["wer"])
+        return pairs[len(pairs) // 2]
 
     async def evaluate_service(
         self,
@@ -833,66 +897,64 @@ Show your work clearly, then call calculate_wer with your verified counts."""
         async def _eval_sample(sample):
             nonlocal completed
 
-            async with self._api_semaphore:
-                # Get result and ground truth
-                result, gt = await self.db.get_result_with_ground_truth(
-                    sample.sample_id, service_name, model_name
-                )
+            # Get result and ground truth
+            result, gt = await self.db.get_result_with_ground_truth(
+                sample.sample_id, service_name, model_name
+            )
 
-                if not result or not result.transcription:
-                    logger.warning(f"No transcription for sample {sample.sample_id}")
-                    return
+            if not result or not result.transcription:
+                logger.warning(f"No transcription for sample {sample.sample_id}")
+                return
 
-                if not gt:
-                    logger.warning(f"No ground truth for sample {sample.sample_id}")
-                    return
+            if not gt:
+                logger.warning(f"No ground truth for sample {sample.sample_id}")
+                return
 
-                # Evaluate with Claude (with retry and timeout)
-                eval_pair = await self.evaluate_with_retry(
-                    gt.text, result.transcription, filename=sample.sample_id
-                )
+            # Evaluate with Claude (with retry and timeout)
+            eval_pair = await self.evaluate_repeated(
+                gt.text, result.transcription, filename=sample.sample_id
+            )
 
-                if eval_pair is None:
-                    logger.error(f"Failed to evaluate {sample.sample_id}, skipping")
-                    return
+            if eval_pair is None:
+                logger.error(f"Failed to evaluate {sample.sample_id}, skipping")
+                return
 
-                eval_result, trace = eval_pair
+            eval_result, trace = eval_pair
 
-                # Update trace with sample info
-                trace.sample_id = sample.sample_id
-                trace.service_name = service_name
-                trace.model_name = model_name
+            # Update trace with sample info
+            trace.sample_id = sample.sample_id
+            trace.service_name = service_name
+            trace.model_name = model_name
 
-                # Store the trace
-                await self.db.insert_semantic_wer_trace(trace)
+            # Store the trace
+            await self.db.insert_semantic_wer_trace(trace)
 
-                # Create metrics
-                metrics = WERMetrics(
-                    sample_id=sample.sample_id,
-                    service_name=service_name,
-                    model_name=model_name,
-                    wer=eval_result["wer"],
-                    substitutions=eval_result["substitutions"],
-                    deletions=eval_result["deletions"],
-                    insertions=eval_result["insertions"],
-                    reference_words=eval_result["reference_words"],
-                    errors=trace.errors,
-                    normalized_reference=eval_result.get("normalized_reference"),
-                    normalized_hypothesis=eval_result.get("normalized_hypothesis"),
-                    timestamp=datetime.now(UTC),
-                )
+            # Create metrics
+            metrics = WERMetrics(
+                sample_id=sample.sample_id,
+                service_name=service_name,
+                model_name=model_name,
+                wer=eval_result["wer"],
+                substitutions=eval_result["substitutions"],
+                deletions=eval_result["deletions"],
+                insertions=eval_result["insertions"],
+                reference_words=eval_result["reference_words"],
+                errors=trace.errors,
+                normalized_reference=eval_result.get("normalized_reference"),
+                normalized_hypothesis=eval_result.get("normalized_hypothesis"),
+                judge=self.judge,
+                timestamp=datetime.now(UTC),
+            )
 
-                # Store metrics
-                await self.db.insert_wer_metrics(metrics)
-                results.append(metrics)
+            # Store metrics
+            await self.db.insert_wer_metrics(metrics)
+            results.append(metrics)
 
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, len(samples), sample.sample_id)
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(samples), sample.sample_id)
 
-                logger.debug(
-                    f"[{completed}/{len(samples)}] {sample.sample_id}: WER={metrics.wer:.2%}"
-                )
+            logger.debug(f"[{completed}/{len(samples)}] {sample.sample_id}: WER={metrics.wer:.2%}")
 
         await asyncio.gather(*(_eval_sample(sample) for sample in samples))
 

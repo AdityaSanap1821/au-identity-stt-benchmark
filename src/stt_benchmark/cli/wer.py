@@ -132,6 +132,7 @@ def calculate_wer(
         console.print(f"Ground truth coverage: {gt_count}/{sample_count} samples\n")
 
         evaluator = SemanticWEREvaluator(db_path=db_path)
+        console.print(f"Judge: {evaluator.judge}\n")
 
         console.print("Warming prompt cache...", end=" ")
         try:
@@ -141,9 +142,25 @@ def calculate_wer(
             console.print(f"[yellow]skipped ({e})[/yellow]\n")
 
         all_stats = []
+        mixed_judge_services = []
 
         for service_name in service_list:
             console.print(f"\n[bold]Evaluating semantic WER for {service_name.value}...[/bold]")
+
+            # Scores from different judges aren't comparable, so never add
+            # results alongside ones another judge produced.
+            if not force_recalculate:
+                judge_counts = await db.get_wer_judge_counts(service_name, model)
+                other_judges = {j: n for j, n in judge_counts.items() if j != evaluator.judge}
+                if other_judges:
+                    console.print(
+                        f"  [red]{sum(other_judges.values())} existing results were scored"
+                        " by a different judge; skipping[/red]"
+                    )
+                    for judge, count in other_judges.items():
+                        console.print(f"    {count} by {judge or 'an unrecorded judge'}")
+                    mixed_judge_services.append(service_name)
+                    continue
 
             # Delete existing WER metrics if force recalculate
             if force_recalculate:
@@ -198,6 +215,15 @@ def calculate_wer(
         if all_stats:
             console.print("\n")
             print_wer_summary(all_stats)
+
+        if mixed_judge_services:
+            names = ",".join(s.value for s in mixed_judge_services)
+            flags = (f" --model {model}" if model else "") + (" --test" if test else "")
+            console.print(
+                "\n[yellow]Some services have results from a different judge. To re-score them"
+                f" with the current judge, run:[/yellow]\n  stt-benchmark wer --services {names}"
+                f"{flags} --force-recalculate"
+            )
 
         await evaluator.close()
         await db.close()
