@@ -549,6 +549,7 @@ def create_xai() -> FrameProcessor:
     return XAISTTService(
         api_key=_get_env("XAI_API_KEY"),
         settings=XAISTTService.Settings(
+            model="grok-voice-transcribe-2.0",
             language=Language.EN,
         ),
     )
@@ -771,7 +772,7 @@ STT_SERVICES: dict[str, ServiceDefinition] = {
     "xai": ServiceDefinition(
         factory=create_xai,
         vendor="xAI",
-        model_label="N/A",
+        model_label="grok-voice-transcribe-2.0",
         required_env_vars=["XAI_API_KEY"],
     ),
 }
