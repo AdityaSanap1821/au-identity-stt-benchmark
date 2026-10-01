@@ -13,6 +13,7 @@ a contributor's row into it — can share exactly one definition of the format.
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -41,14 +42,39 @@ METRIC_KEYS = (
     "perfect_pct",
     "wer_mean",
 )
+# Optional key: whether the row was scored by the previous WER judge.
+OPTIONAL_KEYS = ("previous_judge",)
+
+# Marks WER cells scored by the previous judge; explained under the table.
+PREVIOUS_JUDGE_MARK = "†"
+
+# "0.80%", optionally followed by the previous-judge mark.
+_WER_CELL = re.compile(rf"^([\d.]+)%\s*({PREVIOUS_JUDGE_MARK})?$")
+
+
+def _format_wer(value: float, previous_judge: bool) -> str:
+    return f"{value:.2f}%{PREVIOUS_JUDGE_MARK if previous_judge else ''}"
+
+
+def _parse_wer(cell: str) -> tuple[float, bool]:
+    match = _WER_CELL.match(cell)
+    if not match:
+        raise ValueError(f"not a WER cell: {cell!r}")
+    value, mark = match.groups()
+    return float(value), bool(mark)
 
 
 def format_row(vendor: str, model_label: str, m: dict) -> str:
-    """Render one ``| ... |`` data row. ``m`` holds the METRIC_KEYS in ms / %."""
+    """Render one ``| ... |`` data row.
+
+    ``m`` holds the METRIC_KEYS in ms / %, and optionally the OPTIONAL_KEYS.
+    """
+    previous_judge = m.get("previous_judge", False)
     return (
         f"| {vendor} | {model_label} "
         f"| {m['success_rate']:.1f}% | {m['perfect_pct']:.1f}% "
-        f"| {m['wer_mean']:.2f}% | {m['pooled_wer']:.2f}% "
+        f"| {_format_wer(m['wer_mean'], previous_judge)} "
+        f"| {_format_wer(m['pooled_wer'], previous_judge)} "
         f"| {m['ttfb_median']:.0f}ms | {m['ttfb_p95']:.0f}ms | {m['ttfb_p99']:.0f}ms |"
     )
 
@@ -78,8 +104,8 @@ def parse_table_rows(content: str) -> list[dict]:
     Reads the block between the ``RESULTS_TABLE`` markers when present, otherwise
     scans the whole text for pipe-delimited rows. The header row, the
     ``|---|---|`` separator, and any row whose metric cells aren't numeric are
-    skipped. Each returned dict has ``vendor``, ``model``, and the METRIC_KEYS
-    (values in ms / %).
+    skipped. Each returned dict has ``vendor``, ``model``, the METRIC_KEYS
+    (values in ms / %), and the OPTIONAL_KEYS (``False`` when absent).
     """
     if README_TABLE_START in content and README_TABLE_END in content:
         _, _, rest = content.partition(README_TABLE_START)
@@ -103,17 +129,20 @@ def parse_table_rows(content: str) -> list[dict]:
         if vendor.lower() == "vendor" or set(vendor) <= set("-: "):
             continue
         try:
+            wer_mean, mean_mark = _parse_wer(cells[4])
+            pooled_wer, pooled_mark = _parse_wer(cells[5])
             rows.append(
                 {
                     "vendor": vendor,
                     "model": model,
                     "success_rate": _num(cells[2]),
                     "perfect_pct": _num(cells[3]),
-                    "wer_mean": _num(cells[4]),
-                    "pooled_wer": _num(cells[5]),
+                    "wer_mean": wer_mean,
+                    "pooled_wer": pooled_wer,
                     "ttfb_median": _num(cells[6]),
                     "ttfb_p95": _num(cells[7]),
                     "ttfb_p99": _num(cells[8]),
+                    "previous_judge": mean_mark or pooled_mark,
                 }
             )
         except ValueError:
@@ -168,6 +197,7 @@ def upsert_readme_rows(
     for definition, m in new_rows:
         row = {"vendor": definition.vendor, "model": definition.model_label}
         row.update({k: m[k] for k in METRIC_KEYS})
+        row.update({k: m.get(k) for k in OPTIONAL_KEYS})
         by_key[(definition.vendor.lower(), definition.model_label.lower())] = row
         written.append(f"{definition.vendor} — {definition.model_label}")
 

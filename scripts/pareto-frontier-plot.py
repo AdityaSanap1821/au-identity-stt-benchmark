@@ -9,7 +9,12 @@ from pathlib import Path
 # Add parent to path for imports when running as script
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from stt_benchmark.reporting.readme_table import METRIC_KEYS, parse_table_rows  # noqa: E402
+from stt_benchmark.reporting.readme_table import (  # noqa: E402
+    METRIC_KEYS,
+    OPTIONAL_KEYS,
+    PREVIOUS_JUDGE_MARK,
+    parse_table_rows,
+)
 
 LATENCY_METRICS = {
     "median": {"key": "ttfb_median", "label": "TTFS Median", "suffix": ""},
@@ -132,10 +137,30 @@ def plot_pareto_frontier(
         zorder=4,
     )
 
-    # All services: one hue, ring in the surface color for separation.
+    # All services: one hue, ring in the surface color for separation. Rows
+    # scored by the previous judge are drawn hollow.
+    previous = [bool(data[n].get("previous_judge")) for n in names]
+    current = [i for i, p in enumerate(previous) if not p]
     ax.scatter(
-        ttfb_values, wer_values, s=55, color=DOT, edgecolors=SURFACE, linewidths=1.2, zorder=5
+        [ttfb_values[i] for i in current],
+        [wer_values[i] for i in current],
+        s=55,
+        color=DOT,
+        edgecolors=SURFACE,
+        linewidths=1.2,
+        zorder=5,
     )
+    previous_idx = [i for i, p in enumerate(previous) if p]
+    if previous_idx:
+        ax.scatter(
+            [ttfb_values[i] for i in previous_idx],
+            [wer_values[i] for i in previous_idx],
+            s=55,
+            facecolors=SURFACE,
+            edgecolors=DOT,
+            linewidths=1.5,
+            zorder=5,
+        )
 
     # Labels: hand-placed offsets where the layout is too dense for the
     # automatic solver, adjustText everywhere else.
@@ -206,7 +231,23 @@ def plot_pareto_frontier(
                 linewidth=12,
                 solid_capstyle="round",
                 label="Pareto frontier",
-            )
+            ),
+            *(
+                [
+                    Line2D(
+                        [],
+                        [],
+                        marker="o",
+                        markersize=7,
+                        linestyle="None",
+                        markerfacecolor=SURFACE,
+                        markeredgecolor=DOT,
+                        label=f"Scored by the previous judge ({PREVIOUS_JUDGE_MARK})",
+                    )
+                ]
+                if previous_idx
+                else []
+            ),
         ],
         loc="upper right",
         frameon=True,
@@ -440,7 +481,7 @@ def get_data_from_readme(readme_path: Path) -> dict:
             label = f"{r['vendor']} {r['model']}"
         else:
             label = r["vendor"]
-        data[label] = {k: r[k] for k in METRIC_KEYS}
+        data[label] = {k: r[k] for k in (*METRIC_KEYS, *OPTIONAL_KEYS)}
     return data
 
 

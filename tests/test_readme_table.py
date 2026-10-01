@@ -121,3 +121,29 @@ def test_upsert_is_idempotent(tmp_path):
     once = readme.read_text()
     upsert_readme_rows(readme, [(defn, _metrics())])
     assert readme.read_text() == once
+
+
+def test_previous_judge_mark_round_trips():
+    line = (
+        "| NVIDIA | Nemotron 3.0 ASR (en) | 100.0% | 76.1% | 1.90%† | 1.95%† "
+        "| 221ms | 238ms | 252ms |"
+    )
+    [parsed] = parse_table_rows(_readme(line + "\n"))
+    assert parsed["previous_judge"] is True
+    assert parsed["wer_mean"] == 1.90
+    assert format_row(parsed["vendor"], parsed["model"], parsed) == line
+
+
+def test_upsert_replaces_previous_judge_row(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        _readme(
+            "| Deepgram | nova-3-general | 99.8% | 76.5% | 1.71%† | 1.62%† | 247ms | 298ms | 326ms |\n"
+        )
+    )
+    defn = SimpleNamespace(vendor="Deepgram", model_label="nova-3-general")
+    upsert_readme_rows(readme, [(defn, _metrics(wer_mean=1.32, pooled_wer=1.37))])
+
+    [row] = parse_table_rows(readme.read_text())
+    assert row["previous_judge"] is False
+    assert row["wer_mean"] == 1.32
