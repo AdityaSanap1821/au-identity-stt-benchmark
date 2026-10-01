@@ -9,30 +9,36 @@ Benchmark results on 1000 samples from the `pipecat-ai/smart-turn-data-v3.1-trai
 <!-- RESULTS_TABLE:START -->
 | Vendor | Model | Transcripts | Perfect | WER Mean | Pooled WER | TTFS Median | TTFS P95 | TTFS P99 |
 |--------|-------|-------------|---------|----------|------------|-------------|----------|----------|
-| AssemblyAI | universal-3-6-pro | 99.9% | 87.0% | 1.06% | 0.96% | 307ms | 401ms | 498ms |
-| AssemblyAI | universal-3-5-pro | 99.9% | 84.7% | 1.44% | 1.22% | 282ms | 354ms | 393ms |
-| AssemblyAI | universal-streaming-english | 99.8% | 66.8% | 3.49% | 3.02% | 256ms | 362ms | 417ms |
-| AWS | N/A | 100.0% | 77.4% | 1.68% | 1.75% | 1136ms | 1527ms | 1897ms |
-| Azure | N/A | 100.0% | 82.9% | 1.21% | 1.18% | 1016ms | 1345ms | 1791ms |
-| Cartesia | ink-2 | 100.0% | 84.2% | 1.47% | 1.25% | 299ms | 328ms | 1584ms |
-| Cartesia | ink-whisper | 99.9% | 60.5% | 3.92% | 4.36% | 266ms | 364ms | 898ms |
-| Deepgram | nova-3-general | 99.8% | 76.5% | 1.71% | 1.62% | 247ms | 298ms | 326ms |
-| ElevenLabs | scribe_v2_realtime | 99.7% | 81.3% | 3.16% | 3.12% | 281ms | 348ms | 407ms |
-| Google | gemini-3.5-transcribe-live | 99.9% | 78.0% | 2.24% | 2.24% | 458ms | 532ms | 599ms |
-| Google | latest-long | 100.0% | 69.0% | 2.84% | 2.85% | 878ms | 1155ms | 1570ms |
-| Gradium | default | 99.8% | 65.1% | 3.56% | 3.71% | 570ms | 596ms | 622ms |
-| Meta | muse-voice-transcribe-1.0 | 99.9% | 89.2% | 0.97% | 0.83% | 392ms | 1292ms | 1922ms |
-| Mistral | voxtral-mini-transcribe-realtime-2602 | 99.3% | 68.8% | 4.44% | 4.97% | 525ms | 973ms | 1913ms |
-| NVIDIA | Nemotron 3.0 ASR (en) | 100.0% | 76.1% | 1.90% | 1.95% | 221ms | 238ms | 252ms |
-| NVIDIA | Nemotron 3.5 ASR (multilingual) | 99.6% | 62.0% | 4.54% | 4.58% | 236ms | 253ms | 266ms |
-| OpenAI | gpt-4o-transcribe | 99.3% | 75.9% | 3.24% | 3.06% | 637ms | 965ms | 1655ms |
-| OpenAI | gpt-realtime-whisper | 100.0% | 72.5% | 2.92% | 2.73% | 740ms | 878ms | 1080ms |
-| Smallest AI | pulse | 100.0% | 72.4% | 2.30% | 2.37% | 398ms | 533ms | 1593ms |
-| Soniox | stt-rt-v5 | 99.8% | 83.3% | 1.34% | 1.27% | 260ms | 305ms | 313ms |
-| Soniox | stt-rt-v4 | 99.8% | 84.1% | 1.25% | 1.29% | 249ms | 281ms | 310ms |
-| Speechmatics | linden-1 | 99.5% | 84.5% | 1.21% | 1.05% | 369ms | 438ms | 690ms |
-| Speechmatics | N/A | 99.7% | 83.2% | 1.40% | 1.07% | 495ms | 676ms | 736ms |
+| AssemblyAI | universal-3-6-pro | 99.9% | 88.7% | 0.89% | 0.80% | 307ms | 401ms | 498ms |
+| AssemblyAI | universal-3-5-pro | 99.9% | 86.0% | 1.12% | 0.95% | 282ms | 354ms | 393ms |
+| AssemblyAI | universal-streaming-english | 99.8% | 66.8% | 2.81% | 2.42% | 256ms | 362ms | 417ms |
+| AWS | N/A | 100.0% | 79.1% | 1.26% | 1.35% | 1136ms | 1527ms | 1897ms |
+| Azure | N/A | 100.0% | 83.5% | 0.98% | 1.01% | 1016ms | 1345ms | 1791ms |
+| Cartesia | ink-2 | 100.0% | 83.6% | 1.14% | 1.02% | 299ms | 328ms | 1584ms |
+| Cartesia | ink-whisper | 99.9% | 61.4% | 3.32% | 3.78% | 266ms | 364ms | 898ms |
+| Deepgram | nova-3-general | 99.8% | 77.7% | 1.32% | 1.37% | 247ms | 298ms | 326ms |
+| ElevenLabs | scribe_v2_realtime | 99.7% | 80.3% | 3.05% | 3.13% | 281ms | 348ms | 407ms |
+| Google | gemini-3.5-transcribe-live | 99.9% | 78.3% | 1.93% | 1.97% | 458ms | 532ms | 599ms |
+| Google | latest-long | 100.0% | 69.7% | 2.46% | 2.46% | 878ms | 1155ms | 1570ms |
+| Gradium | default | 99.3% | 65.6% | 3.81% | 3.79% | 585ms | 614ms | 623ms |
+| Meta | muse-voice-transcribe-1.0 | 99.9% | 89.5% | 0.80% | 0.73% | 392ms | 1292ms | 1922ms |
+| Mistral | voxtral-mini-transcribe-realtime-2602 | 99.3% | 67.7% | 4.49% | 5.11% | 525ms | 973ms | 1913ms |
+| NVIDIA | Nemotron 3.0 ASR (en) | 100.0% | 76.1% | 1.90%† | 1.95%† | 221ms | 238ms | 252ms |
+| NVIDIA | Nemotron 3.5 ASR (multilingual) | 99.6% | 62.0% | 4.54%† | 4.58%† | 236ms | 253ms | 266ms |
+| OpenAI | gpt-4o-transcribe | 99.3% | 75.7% | 3.10% | 2.95% | 637ms | 965ms | 1655ms |
+| OpenAI | gpt-realtime-whisper | 100.0% | 73.3% | 2.41% | 2.30% | 740ms | 878ms | 1080ms |
+| Smallest AI | pulse | 100.0% | 74.0% | 1.85% | 1.94% | 398ms | 533ms | 1593ms |
+| Soniox | stt-rt-v5 | 99.8% | 83.6% | 1.11% | 1.09% | 260ms | 305ms | 313ms |
+| Soniox | stt-rt-v4 | 99.8% | 83.2% | 1.04% | 1.13% | 249ms | 281ms | 310ms |
+| Speechmatics | linden-1 | 99.5% | 83.9% | 1.11% | 0.96% | 369ms | 438ms | 690ms |
+| Speechmatics | N/A | 99.7% | 83.1% | 1.17% | 0.96% | 495ms | 676ms | 736ms |
 <!-- RESULTS_TABLE:END -->
+
+Small WER differences aren't meaningful on this data. Among the most accurate services, differences of less than about 0.25 percentage points are within the 95% confidence interval from bootstrap resampling of the benchmark samples, so those services can't be reliably ranked against each other; the margin is wider for less accurate services.
+
+† Scored by the previous judge (Claude Sonnet 4.5), which reports WER about 15% higher on average than the current judge. These rows will be re-scored.
+
+> **Scoring update (September 2026):** Semantic WER is now judged by Claude Sonnet 5.5, replacing Claude Sonnet 4.5. Repeated words, stutters, and restarts in a transcription no longer count as errors, and a word split in two or merged with its neighbour counts as one error. WER fell for almost every service, by about 13% on average, mostly from fewer counted insertions; the Pareto frontier is unchanged. Earlier results are in the git history. See [Semantic WER](#semantic-wer) for how scoring works.
 
 ### Latency vs Accuracy Trade-off
 
@@ -41,6 +47,8 @@ Benchmark results on 1000 samples from the `pipecat-ai/smart-turn-data-v3.1-trai
 ![STT Service Pareto Frontier - Median](assets/stt_pareto_frontier.png)
 
 The Pareto frontier shows services that offer the best trade-off between latency and accuracy—no other service is better on both metrics. Services on the frontier represent efficient choices depending on your priorities.
+
+Each point is a service's pooled WER. Points close together on the WER axis may not differ meaningfully; see the note under the [results table](#results-summary).
 
 ### Latency Consistency
 
@@ -54,9 +62,9 @@ For production voice agents, **tail latency matters more than median**. Even occ
 
 | Metric | Description |
 |--------|-------------|
-| **Transcripts** | Percentage of samples where STT successfully returned a transcription |
-| **Perfect** | Perfect transcriptions (0% semantic WER) out of total benchmark runs |
-| **WER Mean** | Average semantic word error rate across all samples |
+| **Transcripts** | Percentage of samples where STT successfully returned a transcription. Samples without one are left out of the WER and Perfect columns |
+| **Perfect** | Transcriptions with 0% semantic WER, out of the samples with a transcription |
+| **WER Mean** | Average semantic word error rate across samples |
 | **Pooled WER** | Weighted WER (total errors / total reference words) |
 | **TTFS Median** | Median time from user stops speaking to final transcription segment |
 | **TTFS P95** | 95th percentile TTFS - worst 5% of samples have latency above this |
@@ -182,8 +190,11 @@ Traditional WER penalizes every word difference equally. "gonna" vs "going to" c
 | Singular/plural ("license" → "licenses") | Missing words that change intent |
 | Filler words ("um", "uh") | Wrong names, numbers, negations |
 | Number formats ("3" → "three") | Factual errors |
+| Repeated words, stutters, and restarts ("I, I guess") | A word split or merged ("backyard" → "back card"), as one error |
 
 This gives accuracy metrics that reflect real-world impact on downstream LLM applications.
+
+The judge lists the errors it finds; the WER is computed from that list, divided by a word count calculated once for each reference, so every service is scored against the same count for the same sentence.
 
 The judge is Claude Sonnet 5.5 with adaptive thinking at `medium` effort, configured in [`semantic_wer.py`](src/stt_benchmark/evaluation/semantic_wer.py). Each result records the judge that produced it, and `stt-benchmark wer` won't add results to a service that another judge scored, since the two sets of scores aren't comparable. After changing the judge, re-score with `--force-recalculate`. To measure a judge before re-scoring with it, use the [judge experiment scripts](scripts/README.md#judge-experiments).
 
