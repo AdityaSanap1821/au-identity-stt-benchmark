@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import time
 import uuid
 from collections import Counter
@@ -333,11 +334,15 @@ CALCULATE_WER_TOOL = {
 
 USER_PROMPT_TEMPLATE = """Please calculate the Word Error Rate (WER) for this ASR transcription.
 
-**Reference (ground truth):**
-{reference}
+The reference (ground truth) and the hypothesis (ASR transcription) are exactly the text inside their tags.
 
-**Hypothesis (ASR transcription):**
+<reference>
+{reference}
+</reference>
+
+<hypothesis>
 {hypothesis}
+</hypothesis>
 
 Follow the process: NORMALIZE → ALIGN → COUNT → VERIFY → CALCULATE
 
@@ -403,6 +408,50 @@ def error_weight(error: dict) -> int:
     if min(reference_words, hypothesis_words) <= 1:
         return 1
     return reference_words
+
+
+_WORD_PUNCTUATION = ".,!?;:\"'()[]{}…"
+# Words a contraction ending expands to ("it's" → "it is").
+_CONTRACTION_WORDS = {
+    "'s": ("is", "has"),
+    "'m": ("am",),
+    "'re": ("are",),
+    "'ve": ("have",),
+    "'ll": ("will",),
+    "'d": ("would", "had"),
+    "n't": ("not",),
+}
+
+
+def _hypothesis_vocabulary(hypothesis: str) -> set[str]:
+    """Words in the hypothesis, plus the forms the judge may normalize them to."""
+    words = set()
+    for token in re.split(r"[\s\-]+", hypothesis.lower().replace("’", "'")):
+        token = token.strip(_WORD_PUNCTUATION)
+        words.add(token)
+        for ending, expansions in _CONTRACTION_WORDS.items():
+            if token.endswith(ending):
+                words.add(token[: -len(ending)])
+                words.update(expansions)
+    return words
+
+
+def invented_insertions(errors: list[dict], hypothesis: str) -> bool:
+    """Whether the judge's insertions are mostly words the hypothesis doesn't contain.
+
+    Inserted words come from the hypothesis, so a list of them that mostly
+    isn't there means the judge misread where the hypothesis ends. Numbers are
+    ignored, since the judge may write them as digits or words either way.
+    """
+    vocabulary = _hypothesis_vocabulary(hypothesis)
+    inserted = [
+        w.strip(_WORD_PUNCTUATION)
+        for e in errors
+        if e["type"] == "insertion"
+        for w in (e.get("hypothesis") or "").lower().split()
+    ]
+    missing = [w for w in inserted if w and not w.isdigit() and w not in vocabulary]
+    return len(missing) >= 3 and len(missing) > len(inserted) / 2
 
 
 # The judge configuration. Scores from different judges aren't comparable, so
@@ -685,6 +734,10 @@ class SemanticWEREvaluator:
                             for e in errors
                         ):
                             raise JudgeError(f"judge sent an invalid error list: {errors!r}")
+                        if invented_insertions(errors, hypothesis):
+                            raise JudgeError(
+                                "judge listed inserted words that are not in the hypothesis"
+                            )
                         counts: Counter[str] = Counter()
                         for e in errors:
                             counts[e["type"]] += error_weight(e)
