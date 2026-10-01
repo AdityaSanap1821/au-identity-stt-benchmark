@@ -1,4 +1,4 @@
 {
-  "latency": ["median", "p95"],
+  "latency": ["median"],
   "output": "assets/"
 }
