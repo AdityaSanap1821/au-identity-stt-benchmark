@@ -2,7 +2,11 @@
 
 import pytest
 
-from stt_benchmark.evaluation.semantic_wer import count_reference_words, error_weight
+from stt_benchmark.evaluation.semantic_wer import (
+    count_reference_words,
+    error_weight,
+    invented_insertions,
+)
 
 
 @pytest.mark.parametrize(
@@ -47,3 +51,27 @@ def test_count_reference_words(text, expected):
 )
 def test_error_weight(error, expected):
     assert error_weight(error) == expected
+
+
+def _insertions(*words):
+    return [{"type": "insertion", "reference": None, "hypothesis": w} for w in words]
+
+
+@pytest.mark.parametrize(
+    ("errors", "hypothesis", "expected"),
+    [
+        # Words from the prompt read as part of the hypothesis.
+        (
+            _insertions("follow", "the", "process", "normalize", "align", "count"),
+            '"Tell me about the Globe Theatre.',
+            True,
+        ),
+        # Normalized forms of words that are in the hypothesis.
+        (_insertions("it", "is", "1", "0"), "the number ending in 780? It's 1-0.", False),
+        (_insertions("do", "not", "know"), "I don't know", False),
+        # A couple of missing words is tolerated.
+        (_insertions("um", "uh"), "book a table", False),
+    ],
+)
+def test_invented_insertions(errors, hypothesis, expected):
+    assert invented_insertions(errors, hypothesis) is expected
