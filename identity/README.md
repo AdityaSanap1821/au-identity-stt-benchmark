@@ -33,6 +33,17 @@ uv run python identity/score.py
 uv run python identity/matcher.py
 ```
 
+Real-voice set (optional): record the lines in `RECORDING_SCRIPT.md` into `identity_data/real/`, then
+
+```bash
+uv run python identity/real_voice.py ingest
+uv run python identity/real_voice.py check
+uv run python identity/run.py --vendor deepgram --condition none --set real
+uv run python identity/matcher.py --real
+```
+
+`check` re-transcribes each split clip locally and flags any that start with leftover audio from the previous line.
+
 Keys go in `.env` (see `env.example`). `--gpu` runs local Whisper on CUDA (needs `nvidia-cublas-cu12` and
 `nvidia-cudnn-cu12` in the environment). Generated audio, transcripts and the real-voice recordings stay in
 `identity_data/`, which is not committed.
