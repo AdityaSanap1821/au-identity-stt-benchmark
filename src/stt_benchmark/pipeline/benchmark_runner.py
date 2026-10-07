@@ -15,6 +15,7 @@ from pipecat.workers.runner import WorkerRunner
 
 if TYPE_CHECKING:
     import aiohttp
+    from pipecat.processors.frame_processor import FrameProcessor
 
     from stt_benchmark.storage.database import Database
 
@@ -64,6 +65,7 @@ class BenchmarkRunner:
         sample: AudioSample,
         service_name: ServiceName,
         model: str | None = None,
+        stt_factory: Callable[[], "FrameProcessor"] | None = None,
     ) -> BenchmarkResult:
         """Benchmark a single audio sample with an STT service.
 
@@ -71,6 +73,8 @@ class BenchmarkRunner:
             sample: The audio sample to benchmark.
             service_name: The STT service to use.
             model: Optional model name override.
+            stt_factory: Optional factory that builds the STT service instead of the
+                registry default (e.g. to pass per-sample keyterms).
 
         Returns:
             BenchmarkResult with TTFB and transcription.
@@ -111,6 +115,7 @@ class BenchmarkRunner:
                         metrics_observer=metrics_observer,
                         transcription_observer=transcription_observer,
                         aiohttp_session=session,
+                        stt_factory=stt_factory,
                     )
             else:
                 return await self._run_pipeline(
@@ -120,6 +125,7 @@ class BenchmarkRunner:
                     audio_data=audio_data,
                     metrics_observer=metrics_observer,
                     transcription_observer=transcription_observer,
+                    stt_factory=stt_factory,
                 )
 
         except Exception as e:
@@ -141,6 +147,7 @@ class BenchmarkRunner:
         metrics_observer: MetricsCollectorObserver,
         transcription_observer: TranscriptionCollectorObserver,
         aiohttp_session: "aiohttp.ClientSession | None" = None,
+        stt_factory: Callable[[], "FrameProcessor"] | None = None,
     ) -> BenchmarkResult:
         """Run the benchmark pipeline for a single sample.
 
@@ -157,7 +164,11 @@ class BenchmarkRunner:
             BenchmarkResult with TTFB and transcription.
         """
         # Create STT service using its factory
-        stt_service = create_stt_service(service_name, aiohttp_session=aiohttp_session)
+        stt_service = (
+            stt_factory()
+            if stt_factory
+            else create_stt_service(service_name, aiohttp_session=aiohttp_session)
+        )
 
         # Create transport with audio
         # Pass transcription_received event so transport sends silence

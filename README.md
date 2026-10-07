@@ -1,5 +1,10 @@
 # STT Benchmark
 
+> **This fork** adds [`identity/`](identity/README.md): a small experiment on how well streaming STT captures
+> Australian identity details (names, spelled names, emails, dates of birth, addresses) on phone-quality audio,
+> with field-level scoring. Results: [identity/RESULTS.md](identity/RESULTS.md). Everything below is the
+> upstream Pipecat benchmark, unchanged.
+
 A framework for benchmarking Speech-to-Text services with TTFS (Time To Final Segment) latency and Semantic WER (Word Error Rate) accuracy measurement.
 
 ## Results Summary

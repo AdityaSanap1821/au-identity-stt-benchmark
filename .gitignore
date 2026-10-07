@@ -52,3 +52,5 @@ examples/**/web-build/
 # Benchmarks
 stt_benchmark_data/
 credentials.json
+# Identity benchmark (generated audio + results)
+identity_data/
